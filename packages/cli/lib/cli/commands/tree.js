@@ -1,0 +1,200 @@
+// Tree
+import baseMiddleware from "../middlewares/base.js";
+import {applyProjectConfigOptions, applyWorkspaceOptions, dedupeArray} from "../options.js";
+import chalk from "chalk";
+import {getLogger} from "@ui5/logger";
+const log = getLogger("cli:commands:tree");
+
+const tree = {
+	command: "tree",
+	aliases: ["ls", "list"],
+	describe:
+		"Outputs the dependency tree of the current project to stdout. " +
+		"It takes all relevant parameters of ui5 build into account.",
+	middlewares: [baseMiddleware]
+};
+
+tree.builder = function(cli) {
+	applyProjectConfigOptions(cli);
+	applyWorkspaceOptions(cli);
+	return cli
+		.option("flat", {
+			describe: "Output a flat list of all dependencies instead of a tree hierarchy",
+			type: "boolean",
+			default: false
+		})
+		.option("level", {
+			describe: "Limit the number of levels shown in the tree hierarchy",
+			type: "number"
+		})
+		.option("framework-version", {
+			describe:
+				"Overrides the framework version defined by the project. " +
+				"Takes the same value as the version part of \"ui5 use\"",
+			type: "string"
+		})
+		.option("cache-mode", {
+			// Deprecated
+			hidden: true,
+			describe:
+				"As of UI5 CLI version 5, renamed to '--snapshot-cache'. " +
+				"Use '--snapshot-cache' to control this behavior.",
+			type: "string",
+			choices: ["Default", "Force", "Off"],
+		})
+		.coerce("cache-mode", (opt) => {
+			opt = dedupeArray(opt);
+			// Log a warning if this option is used
+			if (opt !== undefined) {
+				log.warn("As of UI5 CLI version 5, '--cache-mode' is renamed to '--snapshot-cache'. " +
+					"Use '--snapshot-cache' to control this behavior.");
+			}
+			return opt;
+		})
+		.option("snapshot-cache", {
+			describe:
+				"Cache mode to use when consuming SNAPSHOT versions of framework dependencies. " +
+				"The 'Default' behavior is to invalidate the cache after 9 hours. 'Force' uses the cache only and " +
+				"does not create any requests. 'Off' invalidates any existing cache and updates from the repository",
+			type: "string",
+			defaultDescription: "Default", // Use "defaultDescription" to allow undefined (needed for evaluation)
+			choices: ["Default", "Force", "Off"],
+		})
+		.coerce(["framework-version"], dedupeArray);
+};
+
+tree.handler = async function(argv) {
+	let startTime;
+	let elapsedTime;
+	if (argv.perf) {
+		startTime = process.hrtime();
+	}
+	const {graphFromStaticFile, graphFromPackageDependencies} = await import("@ui5/project/graph");
+	let graph;
+	if (argv.dependencyDefinition) {
+		graph = await graphFromStaticFile({
+			filePath: argv.dependencyDefinition,
+			rootConfigPath: argv.config,
+			versionOverride: argv.frameworkVersion,
+			snapshotCache: argv.snapshotCache ?? argv.cacheMode ?? "Default", // Use cacheMode as fallback
+		});
+	} else {
+		graph = await graphFromPackageDependencies({
+			rootConfigPath: argv.config,
+			versionOverride: argv.frameworkVersion,
+			snapshotCache: argv.snapshotCache ?? argv.cacheMode ?? "Default", // Use cacheMode as fallback
+			workspaceConfigPath: argv.workspaceConfig,
+			workspaceName: argv.workspace === false ? null : argv.workspace,
+		});
+	}
+
+	if (argv.perf) {
+		elapsedTime = await getElapsedTime(startTime);
+	}
+
+	let requestedLevels;
+	if (argv.level !== undefined && isNaN(argv.level)) {
+		throw new Error(`The provided 'level' option is not a number`);
+	} else if (argv.level !== undefined) {
+		requestedLevels = argv.level;
+	} else {
+		requestedLevels = Infinity;
+	}
+
+	const projects = new Map();
+	const indentWidth = 4;
+	await graph.traverseBreadthFirst(async ({project, dependencies}) => {
+		projects.set(project.getName(), {
+			render: function(level, connectorIndices, lastChild, renderDeps = true) {
+				let baseString = " ".repeat(level * indentWidth);
+				connectorIndices.forEach((idx) => {
+					baseString = `${baseString.slice(0, idx)}│${baseString.slice(idx + 1)}`;
+				});
+				const connectorString = lastChild ? "╰─" : "├─";
+				let name = chalk.bold(project.getName());
+				if (project.isFrameworkProject()) {
+					name = chalk.blue(name);
+				}
+				process.stdout.write(
+					`${baseString}${connectorString} ${name} ` +
+					`${project.getNamespace() ? chalk.inverse(project.getNamespace()) + " " : ""}` +
+					chalk.dim(`(${project.getVersion()}, ${project.getType()}, ` +
+						`specVersion: ${project.getSpecVersion()}) `) +
+					chalk.dim.italic(`${project.getRootPath()}`)
+				);
+				process.stdout.write("\n");
+
+				const lastIdx = dependencies.length - 1;
+				const newConnectorIndices = [...connectorIndices];
+				if (!lastChild) {
+					newConnectorIndices.push(level * indentWidth);
+				}
+
+				if (level >= requestedLevels) {
+					const msg = chalk.dim.italic(`Dependencies below Level ${level} are hidden`);
+					let nextBaseString = " ".repeat((level + 1) * indentWidth);
+					newConnectorIndices.forEach((idx) => {
+						nextBaseString = `${nextBaseString.slice(0, idx)}│${nextBaseString.slice(idx + 1)}`;
+					});
+					process.stdout.write(`${nextBaseString}╰─ ${msg}`);
+					process.stdout.write("\n");
+					return;
+				}
+				if (renderDeps) {
+					dependencies.forEach((dep, i) => {
+						projects.get(dep).render(level + 1, newConnectorIndices, i === lastIdx);
+					});
+				}
+			}
+		});
+	});
+
+	process.stdout.write(chalk.bold.underline(`Dependencies (${projects.size}):`));
+	process.stdout.write("\n");
+	if (argv.flat) {
+		// Iterate over list of projects, rendering each individually
+		// We need to transform the map into an array in order to know the index
+		// for determining whether we are rendering the last entry (lastChild param)
+		Array.from(projects.values()).forEach(({render: renderProject}, idx, arr) => {
+			renderProject(0, [], idx == arr.length -1, false);
+		});
+	} else {
+		// Recursively render the tree, starting with the first entry of the map
+		projects.values().next().value.render(0, [], true);
+	}
+	process.stdout.write("\n");
+
+	const extensionNames = graph.getExtensionNames();
+	const extensionCount = extensionNames.length;
+	process.stdout.write(chalk.bold.underline(`Extensions (${extensionCount}):`));
+	process.stdout.write("\n");
+	if (extensionCount) {
+		const lastIdx = extensionCount - 1;
+		extensionNames.forEach((extensionName, idx) => {
+			const extension = graph.getExtension(extensionName);
+			const connectorString = idx === lastIdx ? "╰─" : "├─";
+			process.stdout.write(
+				`${connectorString} ${extensionName} ` +
+				chalk.dim(`(${extension.getVersion()}, ${extension.getType()}, ` +
+					`specVersion: ${extension.getSpecVersion()}) `) +
+				chalk.dim.italic(`${extension.getRootPath()}`));
+			process.stdout.write("\n");
+		});
+	} else {
+		process.stdout.write(chalk.italic(`None`));
+		process.stdout.write("\n");
+	}
+	if (argv.perf) {
+		process.stderr.write("\n");
+		process.stderr.write(chalk.blue(
+			`Dependency graph generation took ${chalk.bold(elapsedTime)}`));
+		process.stderr.write("\n");
+	}
+};
+
+async function getElapsedTime(startTime) {
+	const timeDiff = process.hrtime(startTime);
+	const {default: prettyHrtime} = await import("pretty-hrtime");
+	return prettyHrtime(timeDiff);
+}
+export default tree;

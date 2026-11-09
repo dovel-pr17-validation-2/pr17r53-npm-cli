@@ -1,0 +1,524 @@
+import ProjectBuildLogger from "@ui5/logger/internal/loggers/ProjectBuild";
+import crypto from "node:crypto";
+import TaskUtil from "./TaskUtil.js";
+import TaskRunner from "../TaskRunner.js";
+import TaskDefinitions from "../TaskDefinitions.js";
+import {getProjectSignature} from "./getBuildSignature.js";
+import ProjectBuildCache from "../cache/ProjectBuildCache.js";
+import {normalizeInputValue} from "../cache/index/TaskInputSet.js";
+import {quantizeTime, TIME_GRANULARITIES} from "./quantizeTime.js";
+
+/**
+ * Build context of a single project. Always part of an overall
+ * [Build Context]{@link @ui5/project/build/helpers/BuildContext}
+
+ * @memberof @ui5/project/build/helpers
+ */
+class ProjectBuildContext {
+	/**
+	 * Creates a new ProjectBuildContext instance.
+	 *
+	 * Note: This constructor only performs synchronous wiring (logger, TaskUtil, TaskDefinitions).
+	 * It does NOT compute the build signature or initialize the build cache, since both depend on
+	 * `TaskDefinitions#getBuildSignatures()`, which is async. Use the static
+	 * {@link ProjectBuildContext.create} factory to obtain a fully initialized instance.
+	 *
+	 * @param {@ui5/project/build/helpers/BuildContext} buildContext Overall build context
+	 * @param {@ui5/project/specifications/Project} project Project instance to build
+	 * @throws {Error} If 'buildContext' or 'project' is missing
+	 */
+	constructor(buildContext, project) {
+		if (!buildContext) {
+			throw new Error(`Missing parameter 'buildContext'`);
+		}
+		if (!project) {
+			throw new Error(`Missing parameter 'project'`);
+		}
+		this._buildContext = buildContext;
+		this._project = project;
+		this._log = new ProjectBuildLogger({
+			moduleName: "Build",
+			projectName: project.getName(),
+			projectType: project.getType()
+		});
+
+		this._taskUtil = new TaskUtil({
+			projectBuildContext: this
+		});
+		this._taskDefinitions = new TaskDefinitions(
+			buildContext.getGraph(), project, this._taskUtil, buildContext.getTaskRepository());
+
+		// Populated by ProjectBuildContext.create()
+		this._buildSignature = null;
+		this._buildCache = null;
+
+		this._queues = {
+			cleanup: []
+		};
+	}
+
+	/**
+	 * Factory method to create and fully initialize a ProjectBuildContext instance.
+	 *
+	 * Performs the async work that the constructor cannot: collecting task build signatures,
+	 * computing the project build signature, and constructing the
+	 * [ProjectBuildCache]{@link @ui5/project/build/cache/ProjectBuildCache}.
+	 * This is the only supported way to obtain a usable instance for production code; callers
+	 * must not call {@link #getBuildSignature} or {@link #getBuildCache} on an instance created
+	 * via `new` directly.
+	 *
+	 * Source index initialization is deliberately kept separate ({@link #initSourceIndex}) so
+	 * multiple project contexts can initialize their indices in parallel.
+	 *
+	 * @param {@ui5/project/build/helpers/BuildContext} buildContext Overall build context
+	 * @param {@ui5/project/specifications/Project} project Project instance to build
+	 * @param {string} baseSignature Base signature for the build
+	 * @param {object} cacheManager Cache manager instance
+	 * @returns {Promise<@ui5/project/build/helpers/ProjectBuildContext>} Initialized context instance
+	 */
+	static async create(buildContext, project, baseSignature, cacheManager) {
+		const ctx = new ProjectBuildContext(buildContext, project);
+
+		const taskSignatures = await ctx._taskDefinitions.getBuildSignatures();
+		ctx._buildSignature = await getProjectSignature(
+			baseSignature, taskSignatures, project, buildContext.getGraph(), buildContext.getTaskRepository());
+
+		const cacheMode = buildContext.getBuildConfig().cache;
+		ctx._buildCache = new ProjectBuildCache(project, ctx._buildSignature, cacheManager, cacheMode,
+			(type, name) => ctx.resolveInputValue(type, name));
+		return ctx;
+	}
+
+	/**
+	 * Initializes the source index for this project's build cache
+	 *
+	 * Must be called after create() and before any cache operations.
+	 * Separated from create() to allow parallel initialization of multiple projects.
+	 *
+	 * @returns {Promise<void>}
+	 */
+	async initSourceIndex() {
+		await this._buildCache.initSourceIndex();
+	}
+
+	/**
+	 * Checks whether this context is for the root project
+	 *
+	 * @returns {boolean} True if this is the root project context
+	 */
+	isRootProject() {
+		return this._project === this._buildContext.getRootProject();
+	}
+
+	/**
+	 * Retrieves a build configuration option
+	 *
+	 * @param {string} key Option key to retrieve
+	 * @returns {*} Option value
+	 */
+	getOption(key) {
+		return this._buildContext.getOption(key);
+	}
+
+	/**
+	 * Registers a cleanup task to be executed after the build
+	 *
+	 * Cleanup tasks are called after all regular tasks have completed,
+	 * allowing resources to be freed or temporary data to be cleaned up.
+	 *
+	 * @param {Function} callback Cleanup callback function that accepts a force parameter
+	 */
+	registerCleanupTask(callback) {
+		this._queues.cleanup.push(callback);
+	}
+
+	/**
+	 * Re-derives the current normalized value of a recorded task input.
+	 *
+	 * The counterpart to the recording done by
+	 * [MonitoredTaskUtil]{@link @ui5/project/build/helpers/MonitoredTaskUtil}: on a cache lookup the
+	 * build cache re-evaluates each input a task recorded last time against the current environment
+	 * and project graph. A value that differs from the one baked into the cached stage signature
+	 * misses the cache and forces the task to re-run. The recording and lookup sides run values
+	 * through the same {@link normalizeInputValue}, so equal values compare equal.
+	 *
+	 * @param {string} type Input type (e.g. "env", "time", "isRootProject", "getDependencies",
+	 *   "project.*")
+	 * @param {string} name Input name within the type
+	 * @returns {string|undefined} Current normalized value, or <code>undefined</code> for an unknown
+	 *   type or an input that can no longer be resolved (e.g. a project removed from the graph)
+	 */
+	resolveInputValue(type, name) {
+		let rawValue;
+		if (type === "env") {
+			rawValue = process.env[name];
+		} else if (type === "isRootProject") {
+			rawValue = this.isRootProject();
+		} else if (type === "getDependencies") {
+			rawValue = this.getDependencies(name);
+		} else if (type === "time") {
+			// Re-derive the current bucket for the recorded granularity: the same bucket hits the
+			// cache, a rolled-over bucket misses and re-runs the task. A recorded granularity is always
+			// valid (getTime throws on an unknown one at record time); guard anyway so a corrupt cache
+			// row misses the cache instead of throwing during lookup.
+			if (!TIME_GRANULARITIES.includes(name)) {
+				return undefined;
+			}
+			rawValue = quantizeTime(name, this.getBuildTime());
+		} else if (type.startsWith("project.")) {
+			const method = type.slice("project.".length);
+			const project = this.getProject(name);
+			rawValue = project && typeof project[method] === "function" ? project[method]() : undefined;
+		} else {
+			// Unknown input type: cannot re-derive a value
+			return undefined;
+		}
+		return normalizeInputValue(rawValue);
+	}
+
+	/**
+	 * Executes all registered cleanup tasks
+	 *
+	 * Calls all cleanup callbacks in parallel and clears the cleanup queue.
+	 *
+	 * @param {boolean} force Whether to force cleanup even if conditions aren't met
+	 * @returns {Promise<void>}
+	 */
+	async executeCleanupTasks(force) {
+		await Promise.all(this._queues.cleanup.map((callback) => {
+			return callback(force);
+		}));
+		this._queues.cleanup = [];
+	}
+
+	/**
+	 * Retrieves a single project from the dependency graph
+	 *
+	 * @param {string} [projectName] Name of the project to retrieve.
+	 *   Defaults to the project currently being built
+	 * @returns {@ui5/project/specifications/Project|undefined}
+	 *   Project instance or undefined if the project is unknown to the graph
+	 */
+	getProject(projectName) {
+		if (projectName) {
+			return this._buildContext.getGraph().getProject(projectName);
+		}
+		return this._project;
+	}
+
+	/**
+	 * Retrieves a list of direct dependencies of a given project from the dependency graph
+	 *
+	 * @param {string} [projectName] Name of the project to retrieve.
+	 *   Defaults to the project currently being built
+	 * @returns {string[]} Names of all direct dependencies
+	 * @throws {Error} If the requested project is unknown to the graph
+	 */
+	getDependencies(projectName) {
+		return this._buildContext.getGraph().getDependencies(projectName || this._project.getName());
+	}
+
+	/**
+	 * Returns the timestamp of the current build run, used for all time quantization.
+	 *
+	 * Delegates to the overall [BuildContext]{@link @ui5/project/build/helpers/BuildContext}, which
+	 * fixes one timestamp per run. Read live rather than snapshot: this context and its
+	 * [TaskUtil]{@link @ui5/project/build/helpers/TaskUtil} outlive individual runs, while the
+	 * timestamp is refreshed per run.
+	 *
+	 * @returns {Date} The current build run's timestamp
+	 */
+	getBuildTime() {
+		return this._buildContext.getBuildTime();
+	}
+
+	/**
+	 * Gets the list of required dependencies for the current project
+	 *
+	 * Determines which dependencies are actually needed based on the tasks that will be executed.
+	 * Results are cached after the first call.
+	 *
+	 * @returns {Promise<string[]>} Array of required dependency names
+	 */
+	async getRequiredDependencies() {
+		if (this._requiredDependencies) {
+			return this._requiredDependencies;
+		}
+		const taskRunner = this.getTaskRunner();
+		this._requiredDependencies = await taskRunner.getRequiredDependencies();
+		return this._requiredDependencies;
+	}
+
+	/**
+	 * Gets the appropriate resource tag collection for a resource and tag
+	 *
+	 * Project tags belong to the resource's owner. Build tags belong to the executing
+	 * project, including tags on dependency resources. Associates unowned resources
+	 * with the executing project.
+	 *
+	 * @param {@ui5/fs/Resource} resource Resource to get tag collection for
+	 * @param {string} tag Tag to check acceptance for
+	 * @returns {@ui5/fs/internal/ResourceTagCollection} Appropriate tag collection
+	 * @throws {Error} If no collection accepts the given tag
+	 */
+	getResourceTagCollection(resource, tag) {
+		if (!resource.hasProject()) {
+			this._log.silly(`Associating resource ${resource.getPath()} with project ${this._project.getName()}`);
+			resource.setProject(this._project);
+		}
+		const project = this._project.getProjectResources().acceptsProjectTag(tag) ?
+			resource.getProject() : this._project;
+		return project.getResourceTagCollection(resource, tag);
+	}
+
+	/**
+	 * Gets the task utility instance for this build context
+	 *
+	 * @returns {@ui5/project/build/helpers/TaskUtil} Task utility instance
+	 */
+	getTaskUtil() {
+		return this._taskUtil;
+	}
+
+	/**
+	 * Gets the task runner instance for this build context
+	 *
+	 * Creates a TaskRunner instance on first access and caches it for subsequent calls.
+	 * The TaskRunner is responsible for executing all build tasks for the project.
+	 *
+	 * @returns {@ui5/project/build/TaskRunner} Task runner instance
+	 */
+	getTaskRunner() {
+		if (!this._taskRunner) {
+			this._taskRunner = new TaskRunner({
+				project: this._project,
+				log: this._log,
+				buildCache: this._buildCache,
+				taskUtil: this.getTaskUtil(),
+				graph: this._buildContext.getGraph(),
+				taskRepository: this._buildContext.getTaskRepository(),
+				buildConfig: this._buildContext.getBuildConfig(),
+				taskDefinitions: this._taskDefinitions
+			});
+		}
+		return this._taskRunner;
+	}
+
+	/**
+	 * Early check whether a project build is possibly required.
+	 *
+	 * In some cases, the cache state cannot be determined until all dependencies have been processed and
+	 * the cache has been updated with that information. This happens during validateCache().
+	 *
+	 * This method allows for an early check whether a project build can be skipped.
+	 *
+	 * @returns {boolean} True if a build might required, false otherwise
+	 */
+	possiblyRequiresBuild() {
+		if (this.#getBuildManifest()) {
+			// Build manifest present -> No build required
+			return false;
+		}
+		// Without build manifest, check cache state
+		return !this.getBuildCache().isFresh();
+	}
+
+	/**
+	 * Validates the current build cache.
+	 *
+	 * Fetches a fresh dependency reader, asks the build cache whether it is stale, and
+	 * propagates any detected resource changes to dependents. When `prepareForBuild` is
+	 * true, additionally runs the pre-build side effects on the underlying cache
+	 * (discarding pending stage-cache entries from a prior aborted build and capturing
+	 * the current project/dependency readers).
+	 *
+	 * @param {object} [options]
+	 * @param {boolean} [options.prepareForBuild=false] Run pre-build side effects on the
+	 *   underlying cache. Must be true when this call precedes {@link #buildProject}.
+	 * @returns {Promise<true|false>}
+	 *   True if a valid cache was found and is being used. False otherwise (indicating a build is required).
+	 */
+	async validateCache({prepareForBuild = false} = {}) {
+		const perfEnabled = this._log.isLevelEnabled("perf");
+		const readerStart = perfEnabled ? performance.now() : 0;
+		const depReader = await this.getTaskRunner().getDependenciesReader(
+			await this.getTaskRunner().getRequiredDependencies(),
+			true, // Force creation of new reader since project readers might have changed during their (re-)build
+		);
+		if (perfEnabled) {
+			this._log.perf(
+				`getDependenciesReader completed in ${(performance.now() - readerStart).toFixed(2)} ms`);
+		}
+		const cacheStart = perfEnabled ? performance.now() : 0;
+		const boolOrChangedPaths = await this.getBuildCache().validateCache(depReader, {
+			prepareForBuild,
+			dependencySetIdentity: this.#getDependencySetIdentity(),
+		});
+		if (perfEnabled) {
+			this._log.perf(
+				`ProjectBuildCache.validateCache completed in ` +
+				`${(performance.now() - cacheStart).toFixed(2)} ms`);
+		}
+		if (Array.isArray(boolOrChangedPaths)) {
+			// Cache can be used, but some resources have changed
+			// Propagate changed paths to dependents
+			this.propagateResourceChanges(boolOrChangedPaths);
+		}
+		return !!boolOrChangedPaths;
+	}
+
+	/**
+	 * Computes a hash identifying the project's dependency set for build-cache validation.
+	 *
+	 * The identity covers the project's full transitive dependency closure taken from the graph,
+	 * hashed over the sorted dependency ids. It is deliberately the graph closure and not the
+	 * task-scoped required set: the dependency reader exposes the transitive closure to a standard
+	 * dependency-globbing task (getRequiredDependencies() returns only direct dependencies, the
+	 * reader expands them transitively), and the required set flips all-or-nothing with task
+	 * selection, which would trigger spurious refreshes. Ids are used rather than names because a
+	 * project's name and id can differ under npm aliasing and the id is what the cache keys on.
+	 *
+	 * @returns {string} sha256 hex hash over the sorted transitive dependency ids
+	 */
+	#getDependencySetIdentity() {
+		const graph = this._buildContext.getGraph();
+		const ids = graph.getTransitiveDependencies(this._project.getName())
+			.map((name) => graph.getProject(name).getId())
+			.sort();
+		return crypto.createHash("sha256").update(ids.join("\n")).digest("hex");
+	}
+
+	/**
+	 * Builds the project by running all required tasks
+	 *
+	 * Executes all configured build tasks for the project using the task runner.
+	 * Must be called after validateCache({prepareForBuild: true}).
+	 *
+	 * @param {AbortSignal} [signal] Abort signal
+	 */
+	async buildProject(signal) {
+		const changedPaths = await this.getTaskRunner().runTasks(signal);
+		// Propagate changed paths to dependents
+		this.propagateResourceChanges(changedPaths);
+	}
+
+	buildFinished() {
+		this.getBuildCache().buildFinished();
+	}
+
+	/**
+	 * Informs the build cache about changed project source resources
+	 *
+	 * Notifies the cache that source files have changed so it can invalidate
+	 * affected cache entries and mark the cache as stale.
+	 *
+	 * @param {string[]} changedPaths Changed project source file paths
+	 */
+	projectSourcesChanged(changedPaths) {
+		return this._buildCache.projectSourcesChanged(changedPaths);
+	}
+
+	/**
+	 * Informs the build cache about changed dependency resources
+	 *
+	 * Notifies the cache that dependency resources have changed so it can invalidate
+	 * affected cache entries and mark the cache as stale.
+	 *
+	 * @param {string[]} changedPaths Changed dependency resource paths
+	 */
+	dependencyResourcesChanged(changedPaths) {
+		return this._buildCache.dependencyResourcesChanged(changedPaths);
+	}
+
+	/**
+	 * Discards this project's in-memory build cache so that the next build re-scans the
+	 * source tree from scratch. Delegates to
+	 * {@link @ui5/project/build/cache/ProjectBuildCache#discardIncrementalState}.
+	 */
+	discardIncrementalState() {
+		return this._buildCache.discardIncrementalState();
+	}
+
+	propagateResourceChanges(changedPaths) {
+		if (!changedPaths.length) {
+			return;
+		}
+		for (const {project: dep} of this._buildContext.getGraph().traverseDependents(this._project.getName())) {
+			const projectBuildContext = this._buildContext.getBuildContext(dep.getName());
+			if (projectBuildContext) {
+				projectBuildContext.dependencyResourcesChanged(changedPaths);
+			}
+		}
+	}
+
+	/**
+	 * Gets the build manifest if available and compatible
+	 *
+	 * Retrieves the project's build manifest and validates its version.
+	 *
+	 * @returns {object|undefined} Build manifest object or undefined if unavailable or incompatible
+	 */
+	#getBuildManifest() {
+		const manifest = this._project.getBuildManifest();
+		if (!manifest) {
+			return;
+		}
+		// Check whether the manifest can be used for this build
+		if (manifest.manifestVersion === "0.1" || manifest.manifestVersion === "0.2" ||
+			manifest.manifestVersion === "1.0") {
+			return manifest;
+		}
+		// Unknown manifest version can't be used
+		return;
+	}
+
+	/**
+	 * Gets metadata about the previous build from the build manifest
+	 *
+	 * Extracts timestamp and age information from the build manifest if available.
+	 *
+	 * @returns {object|null} Build metadata with timestamp and age, or null if no manifest exists
+	 * @returns {string} return.timestamp ISO timestamp of the previous build
+	 * @returns {string} return.age Human-readable age of the previous build
+	 */
+	getBuildMetadata() {
+		const buildManifest = this.#getBuildManifest();
+		if (!buildManifest) {
+			return null;
+		}
+		const timeDiff = (new Date().getTime() - new Date(buildManifest.timestamp).getTime());
+
+		// TODO: Format age properly
+		return {
+			timestamp: buildManifest.timestamp,
+			age: timeDiff / 1000 + " seconds"
+		};
+	}
+
+	/**
+	 * Gets the project build cache instance
+	 *
+	 * @returns {@ui5/project/build/cache/ProjectBuildCache} Build cache instance
+	 */
+	getBuildCache() {
+		return this._buildCache;
+	}
+
+	async writeBuildCache() {
+		await this._buildCache.writeCache();
+	}
+
+	/**
+	 * Gets the build signature for this project
+	 *
+	 * The build signature uniquely identifies the build configuration and dependencies,
+	 * used for cache validation and invalidation.
+	 *
+	 * @returns {string} Build signature string
+	 */
+	getBuildSignature() {
+		return this._buildSignature;
+	}
+}
+
+export default ProjectBuildContext;

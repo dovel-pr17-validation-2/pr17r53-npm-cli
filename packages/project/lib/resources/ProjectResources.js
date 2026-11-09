@@ -1,0 +1,636 @@
+import {createWorkspace, createReaderCollectionPrioritized} from "@ui5/fs/resourceFactory";
+import MonitoredResourceTagCollection from "@ui5/fs/internal/MonitoredResourceTagCollection";
+import ResourceTagCollection from "@ui5/fs/internal/ResourceTagCollection";
+import Stage from "./Stage.js";
+
+const INITIAL_STAGE_ID = "initial";
+const RESULT_STAGE_ID = "result";
+
+/**
+ * Manages resource access and stages for a project.
+ *
+ * @public
+ * @class
+ * @alias @ui5/project/resources/ProjectResources
+ */
+class ProjectResources {
+	#stages = []; // Stages in order of creation
+
+	// State
+	#currentStage;
+	#currentStageReadIndex;
+	#lastTagCacheImportIndex;
+	#currentStageId;
+
+	// Cache
+	#currentStageWorkspace;
+	#currentStageReaders; // Map to store the various reader styles
+
+	// CAS-backed frozen source reader (set after build or restore from cache)
+	#frozenSourceReader = null;
+
+	// Callbacks (interface object)
+	#getName;
+	#getStyledReader;
+	#applyStyleToReader;
+	#createWriter;
+	#addReadersForWriter;
+
+	// Project tag collection resets at the beginning of every build
+	#projectResourceTagCollection;
+	// Build tag collection resets at the end of every build
+	// (so that those tags are not accessible to dependent projects)
+	#buildResourceTagCollection;
+
+	// Individual monitors per stage
+	#monitoredProjectResourceTagCollection;
+	#monitoredBuildResourceTagCollection;
+
+	#buildManifest;
+
+	/**
+	 * @param {object} options Configuration options
+	 * @param {Function} options.getName Returns the project name (for error messages and reader names)
+	 * @param {Function} options.getStyledReader Gets the source reader for a given style
+	 * @param {Function} options.applyStyleToReader Applies style-specific path transforms to a reader
+	 * @param {Function} options.createWriter Creates a writer for a stage
+	 * @param {Function} options.addReadersForWriter Adds readers for a writer to a readers array
+	 * @param {object} options.buildManifest
+	 */
+	constructor({getName, getStyledReader, applyStyleToReader, createWriter, addReadersForWriter, buildManifest}) {
+		this.#getName = getName;
+		this.#getStyledReader = getStyledReader;
+		this.#applyStyleToReader = applyStyleToReader;
+		this.#createWriter = createWriter;
+		this.#addReadersForWriter = addReadersForWriter;
+		this.#buildManifest = buildManifest;
+
+		this.#initStageMetadata();
+	}
+
+	/**
+	 * Get a [ReaderCollection]{@link @ui5/fs/ReaderCollection} for accessing all resources of the
+	 * project in the specified "style":
+	 *
+	 * <ul>
+	 * <li><b>buildtime:</b> Resource paths are always prefixed with <code>/resources/</code>
+	 *  or <code>/test-resources/</code> followed by the project's namespace.
+	 *  Any configured build-excludes are applied</li>
+	 * <li><b>dist:</b> Resource paths always match with what the UI5 runtime expects.
+	 *  This means that paths generally depend on the project type. Applications for example use a "flat"-like
+	 *  structure, while libraries use a "buildtime"-like structure.
+	 *  Any configured build-excludes are applied</li>
+	 * <li><b>runtime:</b> Resource paths always match with what the UI5 runtime expects.
+	 *  This means that paths generally depend on the project type. Applications for example use a "flat"-like
+	 *  structure, while libraries use a "buildtime"-like structure.
+	 *  This style is typically used for serving resources directly. Therefore, build-excludes are not applied</li>
+	 * <li><b>flat:</b> Resource paths are never prefixed and namespaces are omitted if possible. Note that
+	 *  project types like "theme-library", which can have multiple namespaces, can't omit them.
+	 *  Any configured build-excludes are applied</li>
+	 * </ul>
+	 *
+	 * If project resources have been changed through the means of a workspace, those changes
+	 * are reflected in the provided reader too.
+	 *
+	 * Resource readers always use POSIX-style paths.
+	 *
+	 * @public
+	 * @param {object} [options]
+	 * @param {string} [options.style=buildtime] Path style to access resources.
+	 *   Can be "buildtime", "dist", "runtime" or "flat"
+	 * @returns {@ui5/fs/ReaderCollection} A reader collection instance
+	 */
+	getReader({style = "buildtime"} = {}) {
+		let reader = this.#currentStageReaders.get(style);
+		if (reader) {
+			// Use cached reader
+			return reader;
+		}
+
+		const readers = [];
+		if (this.#currentStage) {
+			// Add current writer as highest priority reader
+			const currentWriter = this.#currentStage.getWriter();
+			if (currentWriter) {
+				this.#addReadersForWriter(readers, currentWriter, style);
+			} else {
+				const currentReader = this.#currentStage.getCachedWriter();
+				if (currentReader) {
+					this.#addReadersForWriter(readers, currentReader, style);
+				}
+			}
+		}
+		// Add readers for previous stages and source
+		readers.push(...this.#getReaders(style));
+
+		reader = createReaderCollectionPrioritized({
+			name: `Reader collection for stage '${this.#currentStageId}' of project ${this.#getName()}`,
+			readers
+		});
+
+		this.#currentStageReaders.set(style, reader);
+		return reader;
+	}
+
+	#getReaders(style = "buildtime") {
+		const readers = [];
+
+		// Add writers for previous stages as readers
+		const stageReadIdx = this.#currentStageReadIndex;
+
+		// Collect writers from all relevant stages
+		for (let i = stageReadIdx; i >= 0; i--) {
+			this.#addReaderForStage(this.#stages[i], readers, style);
+		}
+
+		// Add CAS-backed frozen source reader (if available)
+		// Apply the same style transform that the source reader gets
+		if (this.#frozenSourceReader) {
+			readers.push(this.#applyStyleToReader(this.#frozenSourceReader, style));
+		}
+
+		// Finally add the project's source reader
+		readers.push(this.#getStyledReader(style));
+
+		return readers;
+	}
+
+	/**
+	 * Get the source reader for the project.
+	 *
+	 * @public
+	 * @param {string} [style=buildtime] Path style to access resources
+	 * @returns {@ui5/fs/ReaderCollection} A reader collection instance
+	 */
+	getSourceReader(style = "buildtime") {
+		return this.#getStyledReader(style);
+	}
+
+	/**
+	 * Sets a CAS-backed frozen source reader that provides immutable snapshots
+	 * of untransformed source files. This reader is inserted into the reader chain
+	 * between stage readers and the filesystem source reader, so that downstream
+	 * dependency consumers read from CAS instead of the live filesystem.
+	 *
+	 * @public
+	 * @param {@ui5/fs/AbstractReader} reader CAS-backed reader for frozen source files
+	 */
+	setFrozenSourceReader(reader) {
+		this.#frozenSourceReader = reader;
+		// Invalidate cached readers since the reader chain changed
+		this.#currentStageReaders = new Map();
+	}
+
+	/**
+	 * Get a [DuplexCollection]{@link @ui5/fs/DuplexCollection} for accessing and modifying a
+	 * project's resources. This is always of style <code>buildtime</code>.
+	 *
+	 * Once a project has finished building, this method will throw to prevent further modifications
+	 * since those would have no effect. Use the getReader method to access the project's (modified) resources
+	 *
+	 * @public
+	 * @returns {@ui5/fs/DuplexCollection} DuplexCollection
+	 */
+	getWorkspace() {
+		if (this.#currentStageId === RESULT_STAGE_ID) {
+			throw new Error(
+				`Workspace of project ${this.#getName()} is currently not available. ` +
+				`This might indicate that the project has already finished building ` +
+				`and its content can not be modified further. ` +
+				`Use method 'getReader' for read-only access`);
+		}
+		if (this.#currentStageWorkspace) {
+			return this.#currentStageWorkspace;
+		}
+		const reader = createReaderCollectionPrioritized({
+			name: `Reader collection for stage '${this.#currentStageId}' of project ${this.#getName()}`,
+			readers: this.#getReaders(),
+		});
+		const writer = this.#currentStage.getWriter();
+		const workspace = createWorkspace({
+			reader,
+			writer
+		});
+		this.#currentStageWorkspace = workspace;
+		return workspace;
+	}
+
+	/**
+	 * Seal the workspace of the project, preventing further modifications.
+	 * This is typically called once the project has finished building. Resources from all stages will be used.
+	 *
+	 * A project can be unsealed by calling useStage() again.
+	 *
+	 * @public
+	 */
+	useResultStage() {
+		this.#currentStage = null;
+		this.#currentStageId = RESULT_STAGE_ID;
+		this.#currentStageReadIndex = this.#stages.length - 1; // Read from all stages
+
+		// Unset "current" reader/writer. They will be recreated on demand
+		this.#currentStageReaders = new Map();
+		this.#currentStageWorkspace = null;
+
+		this.#monitoredProjectResourceTagCollection = null;
+		this.#monitoredBuildResourceTagCollection = null;
+	}
+
+	#initStageMetadata() {
+		this.#stages = [];
+		// Initialize with an empty stage for use without stages (i.e. without build cache)
+		this.#currentStage = new Stage(INITIAL_STAGE_ID, this.#createWriter(INITIAL_STAGE_ID));
+		this.#currentStageId = INITIAL_STAGE_ID;
+		this.#currentStageReadIndex = -1;
+		this.#lastTagCacheImportIndex = -1;
+		this.#currentStageReaders = new Map();
+		this.#currentStageWorkspace = null;
+		this.#frozenSourceReader = null;
+		this.#projectResourceTagCollection = null;
+		this.#buildResourceTagCollection = null;
+		this.#monitoredProjectResourceTagCollection = null;
+		this.#monitoredBuildResourceTagCollection = null;
+	}
+
+	#addReaderForStage(stage, readers, style = "buildtime") {
+		const writer = stage.getWriter();
+		if (writer) {
+			this.#addReadersForWriter(readers, writer, style);
+		} else {
+			const reader = stage.getCachedWriter();
+			if (reader) {
+				this.#addReadersForWriter(readers, reader, style);
+			}
+		}
+	}
+
+	/**
+	 * Initialize stages for the build process.
+	 *
+	 * @public
+	 * @param {string[]} stageIds Array of stage IDs to initialize
+	 */
+	initStages(stageIds) {
+		this.#initStageMetadata();
+		for (let i = 0; i < stageIds.length; i++) {
+			const stageId = stageIds[i];
+			const newStage = new Stage(stageId, this.#createWriter(stageId));
+			this.#stages.push(newStage);
+		}
+	}
+
+	/**
+	 * Discards all stage state and returns the instance to its constructor-equivalent
+	 * baseline: a single <code>initial</code> stage, no frozen source reader, and empty
+	 * tag collections.
+	 *
+	 * Used to recover from a build that threw mid-execution. Such a build leaves the
+	 * current stage pointed at the failing task's writer (holding partial output) and
+	 * the tag collections populated.
+	 * After this call the next {@link #getStage} reports the <code>initial</code> stage,
+	 * so the build cache re-initializes stages and re-imports cached results.
+	 *
+	 * @public
+	 */
+	reset() {
+		this.#initStageMetadata();
+	}
+
+	/**
+	 * Get the current stage.
+	 *
+	 * @public
+	 * @returns {Stage|null} The current stage or null if in result stage
+	 */
+	getStage() {
+		return this.#currentStage;
+	}
+
+	/**
+	 * Switch to a specific stage.
+	 *
+	 * @public
+	 * @param {string} stageId The ID of the stage to use
+	 * @throws {Error} If the stage does not exist
+	 */
+	useStage(stageId) {
+		if (stageId === this.#currentStage?.getId()) {
+			// Already using requested stage
+			return;
+		}
+
+		const stageIdx = this.#stages.findIndex((s) => s.getId() === stageId);
+
+		if (stageIdx === -1) {
+			throw new Error(`Stage '${stageId}' does not exist in project ${this.#getName()}`);
+		}
+
+		const stage = this.#stages[stageIdx];
+		this.#currentStage = stage;
+		this.#currentStageId = stageId;
+		this.#currentStageReadIndex = stageIdx - 1; // Read from all previous stages
+
+		// Unset "current" reader/writer caches. They will be recreated on demand
+		this.#currentStageReaders = new Map();
+		this.#currentStageWorkspace = null;
+
+		this.#monitoredProjectResourceTagCollection = null;
+		this.#monitoredBuildResourceTagCollection = null;
+	}
+
+	/**
+	 * Set or replace a stage.
+	 *
+	 * @public
+	 * @param {string} stageId The ID of the stage to set
+	 * @param {Stage|object} stageOrCachedWriter A Stage instance or a cached writer/reader
+	 * @param {Map<string, Map<string, *>>} projectTagOperations
+	 * @param {Map<string, Map<string, *>>} buildTagOperations
+	 * @returns {boolean} True if the stored stage has changed, false otherwise
+	 * @throws {Error} If the stage does not exist or invalid parameters are provided
+	 */
+	setStage(stageId, stageOrCachedWriter, projectTagOperations, buildTagOperations) {
+		const stageIdx = this.#stages.findIndex((s) => s.getId() === stageId);
+		if (stageIdx === -1) {
+			throw new Error(`Stage '${stageId}' does not exist in project ${this.#getName()}`);
+		}
+		if (!stageOrCachedWriter) {
+			throw new Error(
+				`Invalid stage or cache reader provided for stage '${stageId}' in project ${this.#getName()}`);
+		}
+		const oldStage = this.#stages[stageIdx];
+		if (oldStage.getId() !== stageId) {
+			throw new Error(
+				`Stage ID mismatch for stage '${stageId}' in project ${this.#getName()}`);
+		}
+		let newStage;
+		if (stageOrCachedWriter instanceof Stage) {
+			newStage = stageOrCachedWriter;
+			if (oldStage === newStage) {
+				// Same stage as before, nothing to do
+				return false; // Stored stage has not changed
+			}
+		} else {
+			newStage = new Stage(stageId, undefined, stageOrCachedWriter,
+				projectTagOperations, buildTagOperations);
+		}
+		this.#stages[stageIdx] = newStage;
+
+		// If we are updating the current stage, make sure to update and reset all relevant references
+		if (oldStage === this.#currentStage) {
+			this.#currentStage = newStage;
+			// Unset "current" reader/writer. They might be outdated
+			this.#currentStageReaders = new Map();
+			this.#currentStageWorkspace = null;
+		}
+		return true; // Indicate that the stored stage has changed
+	}
+
+	/**
+	 * Reopen a stage with a fresh, empty live writer, discarding any cached read-only stage a prior
+	 * {@link #setStage} installed for it.
+	 *
+	 * Used when a step-based task's stage was a full cache hit that must be re-run after all (a consumed
+	 * producer <code>needs</code> return changed): the fast-path restore had swapped in a read-only cached
+	 * stage via {@link #setStage}, so the stage has no writer, and re-running its invocations needs a writable
+	 * one. The reopened stage reads all previous stages exactly as {@link #useStage} does; the re-run's
+	 * output goes into the fresh writer.
+	 *
+	 * @public
+	 * @param {string} stageId The ID of the stage to reopen
+	 * @throws {Error} If the stage does not exist
+	 */
+	reopenStage(stageId) {
+		const stageIdx = this.#stages.findIndex((s) => s.getId() === stageId);
+		if (stageIdx === -1) {
+			throw new Error(`Stage '${stageId}' does not exist in project ${this.#getName()}`);
+		}
+		const newStage = new Stage(stageId, this.#createWriter(stageId));
+		this.#stages[stageIdx] = newStage;
+		this.#currentStage = newStage;
+		this.#currentStageId = stageId;
+		this.#currentStageReadIndex = stageIdx - 1; // Read from all previous stages
+
+		// Unset "current" reader/writer caches. They will be recreated on demand
+		this.#currentStageReaders = new Map();
+		this.#currentStageWorkspace = null;
+
+		this.#monitoredProjectResourceTagCollection = null;
+		this.#monitoredBuildResourceTagCollection = null;
+	}
+
+	buildFinished() {
+		// Apply pending result tags before cleanup so later reads cannot replay build tags.
+		this.#applyCachedResourceTags();
+		this.#buildResourceTagCollection = null;
+		this.#monitoredBuildResourceTagCollection = null;
+	}
+
+	/**
+	 * Check whether a tag belongs to the resource owner's project.
+	 * This check does not import cached tags or create a stage monitor.
+	 *
+	 * @param {string} [tag] Tag to classify. An omitted tag selects project tags.
+	 * @returns {boolean} Whether the tag belongs to the project collection
+	 */
+	acceptsProjectTag(tag) {
+		return !tag || this.#getProjectResourceTagCollection().acceptsTag(tag);
+	}
+
+	/**
+	 * Gets the appropriate resource tag collection for a resource and tag
+	 *
+	 * Selects this project's collection by tag. The resource can belong to a dependency
+	 * when a task stores build tags for that resource in the executing project's collection.
+	 *
+	 * @param {@ui5/fs/Resource} resource Resource to get tag collection for
+	 * @param {string} tag Tag to check acceptance for
+	 * @returns {@ui5/fs/internal/ResourceTagCollection} Appropriate tag collection
+	 * @throws {Error} If no collection accepts the given tag
+	 */
+	getResourceTagCollection(resource, tag) {
+		return this.#getMonitoredTagCollection(tag, resource);
+	}
+
+	/**
+	 * Returns the monitored tag collection that accepts <code>tag</code>, creating it on first use. The
+	 * routing is by tag alone (project-level tags such as <code>ui5:IsDebugVariant</code> vs. build-level
+	 * tags such as <code>ui5:OmitFromBuildResult</code>); <code>resource</code> is used only to name the
+	 * offending resource when no collection accepts the tag.
+	 *
+	 * @param {string} tag Tag to route
+	 * @param {@ui5/fs/Resource} [resource] Resource the tag is for, for the error message only
+	 * @returns {@ui5/fs/internal/MonitoredResourceTagCollection} The monitored collection
+	 * @throws {Error} If no collection accepts the given tag
+	 */
+	#getMonitoredTagCollection(tag, resource) {
+		this.#applyCachedResourceTags();
+		const projectCollection = this.#getProjectResourceTagCollection();
+		if (!tag || projectCollection.acceptsTag(tag)) {
+			if (!this.#monitoredProjectResourceTagCollection) {
+				this.#monitoredProjectResourceTagCollection = new MonitoredResourceTagCollection(projectCollection);
+			}
+			return this.#monitoredProjectResourceTagCollection;
+		}
+		const buildCollection = this.#getBuildResourceTagCollection();
+		if (buildCollection.acceptsTag(tag)) {
+			if (!this.#monitoredBuildResourceTagCollection) {
+				this.#monitoredBuildResourceTagCollection = new MonitoredResourceTagCollection(buildCollection);
+			}
+			return this.#monitoredBuildResourceTagCollection;
+		}
+		throw new Error(
+			`Could not find collection for resource ${resource ? resource.getPath() : "(tag replay)"} and tag ${tag}`);
+	}
+
+	/**
+	 * Replays a set of tag operations recorded by a
+	 * [StepRunner]{@link @ui5/project/build/helpers/StepRunner} step into the monitored tag collections,
+	 * routing each by tag and applying it by path. Used when a step is restored from cache on a delta
+	 * build: the step did not run, so its <code>set</code>/<code>clear</code> operations are replayed here
+	 * so its tags reappear in this build's tag operations (captured by {@link #getResourceTagOperations}
+	 * like a step that ran). <code>get</code> operations carry no persistent effect and are skipped.
+	 *
+	 * @param {Array<{op: string, path: string, tag: string, value: *}>} tagOperations Recorded operations
+	 */
+	replayTagOperations(tagOperations) {
+		for (const {op, path, tag, value} of tagOperations) {
+			if (op !== "set" && op !== "clear") {
+				continue;
+			}
+			const collection = this.#getMonitoredTagCollection(tag);
+			if (op === "clear") {
+				collection.clearTag(path, tag);
+			} else {
+				collection.setTag(path, tag, value);
+			}
+		}
+	}
+
+	getResourceTagOperations() {
+		return {
+			projectTagOperations: new Map([
+				...this.#currentStage.getCachedProjectTagOperations() ?? [],
+				...this.#monitoredProjectResourceTagCollection?.getTagOperations() ?? [],
+			]),
+			buildTagOperations: new Map([
+				...this.#currentStage.getCachedBuildTagOperations() ?? [],
+				...this.#monitoredBuildResourceTagCollection?.getTagOperations() ?? [],
+			]),
+		};
+	}
+
+	/**
+	 * Imports tag operations into the underlying tag collections.
+	 *
+	 * This is used during delta builds to apply tag operations from a previous stage cache
+	 * that would otherwise be lost because the delta execution only records its own tag operations.
+	 *
+	 * @param {Map<string, Map<string, *>>} [projectTagOperations]
+	 * @param {Map<string, Map<string, *>>} [buildTagOperations]
+	 */
+	importTagOperations(projectTagOperations, buildTagOperations) {
+		if (projectTagOperations?.size) {
+			const projectTagCollection = this.#getProjectResourceTagCollection();
+			for (const [resourcePath, tags] of projectTagOperations.entries()) {
+				for (const [tag, value] of tags.entries()) {
+					projectTagCollection.setTag(resourcePath, tag, value);
+				}
+			}
+		}
+		if (buildTagOperations?.size) {
+			const buildTagCollection = this.#getBuildResourceTagCollection();
+			for (const [resourcePath, tags] of buildTagOperations.entries()) {
+				for (const [tag, value] of tags.entries()) {
+					buildTagCollection.setTag(resourcePath, tag, value);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Returns the project-level resource tag collection.
+	 *
+	 * This provides direct access to the collection holding project-level tags
+	 * (e.g. ui5:IsDebugVariant, ui5:HasDebugVariant), which is needed for
+	 * build manifest creation and reading.
+	 *
+	 * @returns {@ui5/fs/internal/ResourceTagCollection} The project-level resource tag collection
+	 */
+	getProjectResourceTagCollection() {
+		this.#applyCachedResourceTags();
+		return this.#getProjectResourceTagCollection();
+	}
+
+	#getProjectResourceTagCollection() {
+		if (!this.#projectResourceTagCollection) {
+			this.#projectResourceTagCollection = new ResourceTagCollection({
+				allowedTags: ["ui5:IsDebugVariant", "ui5:HasDebugVariant"],
+				allowedNamespaces: ["project"],
+				tags: this.#buildManifest?.tags
+			});
+		}
+		return this.#projectResourceTagCollection;
+	}
+
+	#getBuildResourceTagCollection() {
+		if (!this.#buildResourceTagCollection) {
+			this.#buildResourceTagCollection = new ResourceTagCollection({
+				allowedTags: ["ui5:OmitFromBuildResult", "ui5:IsBundle"],
+				allowedNamespaces: ["build"]
+			});
+		}
+		return this.#buildResourceTagCollection;
+	}
+
+	#applyCachedResourceTags() {
+		// Collect tag ops from all relevant stages
+		const cachedProjectTagOps = [];
+		const cachedBuildTagOps = [];
+
+		for (let i = this.#lastTagCacheImportIndex + 1; i <= this.#currentStageReadIndex; i++) {
+			const projectTagOps = this.#stages[i].getCachedProjectTagOperations();
+			if (projectTagOps) {
+				cachedProjectTagOps.push(projectTagOps);
+			}
+			const buildTagOps = this.#stages[i].getCachedBuildTagOperations();
+			if (buildTagOps) {
+				cachedBuildTagOps.push(buildTagOps);
+			}
+		}
+
+		this.#lastTagCacheImportIndex = this.#currentStageReadIndex;
+
+		const projectTagOps = mergeMaps(...cachedProjectTagOps);
+		const buildTagOps = mergeMaps(...cachedBuildTagOps);
+
+		if (projectTagOps.size) {
+			const projectTagCollection = this.#getProjectResourceTagCollection();
+			for (const [resourcePath, tags] of projectTagOps.entries()) {
+				for (const [tag, value] of tags.entries()) {
+					projectTagCollection.setTag(resourcePath, tag, value);
+				}
+			}
+		}
+		if (buildTagOps.size) {
+			const buildTagCollection = this.#getBuildResourceTagCollection();
+			for (const [resourcePath, tags] of buildTagOps.entries()) {
+				for (const [tag, value] of tags.entries()) {
+					buildTagCollection.setTag(resourcePath, tag, value);
+				}
+			}
+		}
+	}
+}
+
+const mergeMaps = (...maps) => {
+	const result = new Map();
+	for (const map of maps) {
+		for (const [key, value] of map) {
+			result.set(key, value);
+		}
+	}
+	return result;
+};
+
+export default ProjectResources;

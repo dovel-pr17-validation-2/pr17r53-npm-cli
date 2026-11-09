@@ -1,0 +1,966 @@
+import test from "ava";
+import sinon from "sinon";
+import ResourceRequestManager from "../../../../lib/build/cache/ResourceRequestManager.js";
+import ResourceRequestGraph from "../../../../lib/build/cache/ResourceRequestGraph.js";
+
+// Helper to create mock Resource instances
+function createMockResource(path, integrity = "test-hash", lastModified = 1000, size = 100, inode = 1) {
+	return {
+		getOriginalPath: () => path,
+		getPath: () => path,
+		getIntegrity: async () => integrity,
+		getLastModified: () => lastModified,
+		getSize: async () => size,
+		getInode: () => inode,
+		getTags: () => null,
+		getBuffer: async () => Buffer.from("test content"),
+		getStream: () => null
+	};
+}
+
+// Helper to create mock Reader (project or dependency)
+function createMockReader(resources = new Map()) {
+	return {
+		byPath: sinon.stub().callsFake(async (path) => {
+			return resources.get(path) || null;
+		}),
+		byGlob: sinon.stub().callsFake(async (patterns) => {
+			const patternArray = Array.isArray(patterns) ? patterns : [patterns];
+			const results = [];
+			for (const [path, resource] of resources.entries()) {
+				for (const pattern of patternArray) {
+					// Simple pattern matching
+					if (pattern === "/**/*" || pattern === "**/*") {
+						results.push(resource);
+						break;
+					}
+					// Convert glob pattern to regex
+					const regex = new RegExp(pattern.replace(/\*/g, ".*").replace(/\?/g, "."));
+					if (regex.test(path)) {
+						results.push(resource);
+						break;
+					}
+				}
+			}
+			return results;
+		})
+	};
+}
+
+test.afterEach.always(() => {
+	sinon.restore();
+});
+
+// ===== CONSTRUCTOR TESTS =====
+
+test("ResourceRequestManager: Create new instance", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	t.truthy(manager, "Manager instance created");
+	t.true(manager.hasNewOrModifiedCacheEntries(), "New manager has modified entries");
+});
+
+test("ResourceRequestManager: Create with request graph from cache", (t) => {
+	const graph = new ResourceRequestGraph();
+	const manager = new ResourceRequestManager("test.project", "myTask", false, graph);
+
+	t.truthy(manager, "Manager instance created with graph");
+	t.false(manager.hasNewOrModifiedCacheEntries(), "Manager restored from cache has no new entries initially");
+});
+
+test("ResourceRequestManager: Create with differential update enabled", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", true);
+
+	t.truthy(manager, "Manager instance created with differential updates");
+});
+
+test("ResourceRequestManager: Create with unusedAtLeastOnce flag", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false, null, true);
+
+	t.truthy(manager, "Manager instance created");
+	const signatures = manager.getIndexSignatures();
+	t.true(signatures.includes("X"), "Signatures include 'X' for unused state");
+});
+
+// ===== fromCache FACTORY METHOD TESTS =====
+
+test("ResourceRequestManager: fromCache with basic data", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	// Create a manager and add some requests
+	const manager1 = new ResourceRequestManager("test.project", "myTask", false);
+	await manager1.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	// Serialize and restore
+	const cacheData = manager1.toCacheObject();
+	t.truthy(cacheData, "Cache data created");
+
+	const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheData);
+
+	t.truthy(manager2, "Manager restored from cache");
+	t.false(manager2.hasNewOrModifiedCacheEntries(), "Restored manager has no new entries");
+});
+
+test("ResourceRequestManager: fromCache with unusedAtLeastOnce", (t) => {
+	const cacheData = {
+		requestSetGraph: {
+			nodes: [],
+			nextId: 1
+		},
+		rootIndices: [],
+		unusedAtLeastOnce: true
+	};
+
+	const manager = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheData);
+
+	t.truthy(manager, "Manager restored");
+	const signatures = manager.getIndexSignatures();
+	t.true(signatures.includes("X"), "Includes 'X' signature for unused state");
+});
+
+// ===== addRequests TESTS =====
+
+test("ResourceRequestManager: Add path requests", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const result = await manager.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	t.truthy(result, "Result returned");
+	t.truthy(result.setId, "Result has setId");
+	t.truthy(result.signature, "Result has signature");
+	t.is(typeof result.signature, "string", "Signature is a string");
+});
+
+test("ResourceRequestManager: Add pattern requests", async (t) => {
+	const resources = new Map([
+		["/src/a.js", createMockResource("/src/a.js", "hash-a")],
+		["/src/b.js", createMockResource("/src/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const result = await manager.addRequests({
+		paths: [],
+		patterns: [["/src/*.js"]]
+	}, reader);
+
+	t.truthy(result, "Result returned");
+	t.truthy(result.signature, "Result has signature");
+});
+
+test("ResourceRequestManager: Add multiple request sets", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")],
+		["/c.js", createMockResource("/c.js", "hash-c")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	// First request set
+	const result1 = await manager.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	// Second request set (superset)
+	const result2 = await manager.addRequests({
+		paths: ["/a.js", "/b.js", "/c.js"],
+		patterns: []
+	}, reader);
+
+	t.not(result1.signature, result2.signature, "Different signatures for different request sets");
+	t.true(manager.hasNewOrModifiedCacheEntries(), "Has new entries");
+});
+
+test("ResourceRequestManager: Reuse existing request set", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	// Add first request set
+	const result1 = await manager.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	// Add identical request set
+	const result2 = await manager.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	t.is(result1.setId, result2.setId, "Same setId for identical requests");
+	t.is(result1.signature, result2.signature, "Same signature for identical requests");
+});
+
+// ===== recordNoRequests TESTS =====
+
+test("ResourceRequestManager: Record no requests", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const signature = manager.recordNoRequests();
+
+	t.is(signature, "X", "Returns 'X' signature");
+	t.true(manager.hasNewOrModifiedCacheEntries(), "Has new entries");
+});
+
+test("ResourceRequestManager: Record no requests multiple times", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const sig1 = manager.recordNoRequests();
+	const sig2 = manager.recordNoRequests();
+
+	t.is(sig1, "X", "First call returns 'X'");
+	t.is(sig2, "X", "Second call returns 'X'");
+});
+
+// ===== getIndexSignatures TESTS =====
+
+test("ResourceRequestManager: Get signatures from empty manager", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const signatures = manager.getIndexSignatures();
+
+	t.is(signatures.length, 0, "No signatures for empty manager");
+});
+
+test("ResourceRequestManager: Get signatures after adding requests", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	const signatures = manager.getIndexSignatures();
+
+	t.is(signatures.length, 1, "One signature");
+	t.is(typeof signatures[0], "string", "Signature is a string");
+});
+
+test("ResourceRequestManager: Get signatures includes 'X' when unused", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	manager.recordNoRequests();
+
+	const signatures = manager.getIndexSignatures();
+
+	t.true(signatures.includes("X"), "Includes 'X' signature");
+});
+
+// ===== hasNewOrModifiedCacheEntries TESTS =====
+
+test("ResourceRequestManager: New manager has modified entries", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	t.true(manager.hasNewOrModifiedCacheEntries(), "New manager has modified entries");
+});
+
+test("ResourceRequestManager: Restored manager has no modified entries initially", (t) => {
+	const graph = new ResourceRequestGraph();
+	const manager = new ResourceRequestManager("test.project", "myTask", false, graph);
+
+	t.false(manager.hasNewOrModifiedCacheEntries(), "Restored manager has no modified entries");
+});
+
+test("ResourceRequestManager: Adding requests marks as modified", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	const graph = new ResourceRequestGraph();
+	const manager = new ResourceRequestManager("test.project", "myTask", false, graph);
+
+	t.false(manager.hasNewOrModifiedCacheEntries(), "Initially no modified entries");
+
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	t.true(manager.hasNewOrModifiedCacheEntries(), "Has modified entries after adding requests");
+});
+
+test("ResourceRequestManager: Reusing an unchanged request set leaves the manager clean", async (t) => {
+	// A step-based stage records the same request set on every delta build. When that set already exists in
+	// the restored graph, #addRequestSet reuses the existing node and nothing persisted changes, so the
+	// manager must stay clean: otherwise every delta build re-serializes the whole request graph to SQLite.
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")],
+	]);
+	const reader = createMockReader(resources);
+
+	// Record the set once, serialize, and restore a clean manager from the cache.
+	const manager1 = new ResourceRequestManager("test.project", "myTask", false);
+	await manager1.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+	const cacheData = manager1.toCacheObject();
+	const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheData);
+	t.false(manager2.hasNewOrModifiedCacheEntries(), "Restored manager starts clean");
+
+	// Record the identical set again: the exact-match reuse must not flag the manager dirty.
+	await manager2.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+
+	t.false(manager2.hasNewOrModifiedCacheEntries(),
+		"Reusing an unchanged request set leaves the manager clean");
+	t.is(manager2.toCacheObject(), undefined, "A clean manager serializes to nothing");
+});
+
+test("ResourceRequestManager: Adding a new request set to a restored manager flags it dirty", async (t) => {
+	// The counterpart to the reuse case: a genuinely new request set (not present in the restored graph) is a
+	// cache modification and must flag the manager dirty so it is persisted.
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")],
+	]);
+	const reader = createMockReader(resources);
+
+	const manager1 = new ResourceRequestManager("test.project", "myTask", false);
+	await manager1.addRequests({paths: ["/a.js"], patterns: []}, reader);
+	const cacheData = manager1.toCacheObject();
+	const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheData);
+	t.false(manager2.hasNewOrModifiedCacheEntries(), "Restored manager starts clean");
+
+	// A request set that was never recorded before: a new node is created.
+	await manager2.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+
+	t.true(manager2.hasNewOrModifiedCacheEntries(), "A new request set flags the manager dirty");
+});
+
+// ===== toCacheObject TESTS =====
+
+test("ResourceRequestManager: Serialize to cache object", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	const cacheObj = manager.toCacheObject();
+
+	t.truthy(cacheObj, "Cache object created");
+	t.truthy(cacheObj.requestSetGraph, "Has requestSetGraph");
+	t.truthy(cacheObj.rootIndices, "Has rootIndices");
+	t.true(Array.isArray(cacheObj.rootIndices), "rootIndices is an array");
+});
+
+test("ResourceRequestManager: Serialize returns undefined when no changes", (t) => {
+	const graph = new ResourceRequestGraph();
+	const manager = new ResourceRequestManager("test.project", "myTask", false, graph);
+
+	const cacheObj = manager.toCacheObject();
+
+	t.is(cacheObj, undefined, "Returns undefined when no changes");
+});
+
+test("ResourceRequestManager: Serialize includes unusedAtLeastOnce", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	manager.recordNoRequests();
+
+	const cacheObj = manager.toCacheObject();
+
+	t.truthy(cacheObj, "Cache object created");
+	t.true(cacheObj.unusedAtLeastOnce, "Includes unusedAtLeastOnce flag");
+});
+
+test("ResourceRequestManager: Serialize with differential updates", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", true);
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	const cacheObj = manager.toCacheObject();
+
+	t.truthy(cacheObj, "Cache object created");
+	t.truthy(cacheObj.deltaIndices, "Has deltaIndices");
+	t.true(Array.isArray(cacheObj.deltaIndices), "deltaIndices is an array");
+});
+
+// ===== getDeltas TESTS =====
+
+test("ResourceRequestManager: Get deltas returns empty map initially", (t) => {
+	const manager = new ResourceRequestManager("test.project", "myTask", true);
+
+	const deltas = manager.getDeltas();
+
+	t.true(deltas instanceof Map, "Returns a Map");
+	t.is(deltas.size, 0, "Empty initially");
+});
+
+test("ResourceRequestManager: Get deltas after updates", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", true);
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	// Update resource
+	resources.set("/a.js", createMockResource("/a.js", "hash-a-new"));
+
+	// Note: In a real scenario, updateIndices would be called here
+	// For this test, we're just checking the method exists and returns a Map
+	const deltas = manager.getDeltas();
+
+	t.true(deltas instanceof Map, "Returns a Map");
+});
+
+// ===== updateIndices TESTS =====
+
+test("ResourceRequestManager: updateIndices with no requests", async (t) => {
+	const reader = createMockReader(new Map());
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const hasChanges = await manager.updateIndices(reader, []);
+
+	t.false(hasChanges, "No changes when no requests recorded");
+});
+
+test("ResourceRequestManager: updateIndices with no changed paths", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	const hasChanges = await manager.updateIndices(reader, []);
+
+	t.false(hasChanges, "No changes when paths don't match");
+});
+
+test("ResourceRequestManager: updateIndices with matching changed path", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	// Update the resource
+	resources.set("/a.js", createMockResource("/a.js", "hash-a-new"));
+
+	const hasChanges = await manager.updateIndices(reader, ["/a.js"]);
+
+	t.true(hasChanges, "Detects changes for matching path");
+});
+
+test("ResourceRequestManager: updateIndices with pattern matches", async (t) => {
+	const resources = new Map([
+		["/src/a.js", createMockResource("/src/a.js", "hash-a")],
+		["/src/b.js", createMockResource("/src/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({
+		paths: [],
+		patterns: [["/src/*.js"]]
+	}, reader);
+
+	// Update one resource
+	resources.set("/src/a.js", createMockResource("/src/a.js", "hash-a-new"));
+
+	const hasChanges = await manager.updateIndices(reader, ["/src/a.js"]);
+
+	t.true(hasChanges, "Detects changes for pattern-matched resources");
+});
+
+test("ResourceRequestManager: updateIndices with removed resource", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+
+	// Remove a resource
+	resources.delete("/b.js");
+
+	const hasChanges = await manager.updateIndices(reader, ["/b.js"]);
+
+	t.true(hasChanges, "Detects removal of resource");
+});
+
+// ===== refreshIndices TESTS =====
+
+/* eslint-disable-next-line */
+test.skip("ResourceRequestManager: refreshIndices with no requests", async (t) => {
+	const reader = createMockReader(new Map());
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const hasChanges = await manager.refreshIndices(reader);
+
+	t.false(hasChanges, "No changes when no requests recorded");
+});
+
+test("ResourceRequestManager: refreshIndices after adding requests", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+	await manager.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+
+	// Update resources
+	resources.set("/a.js", createMockResource("/a.js", "hash-a-new"));
+
+	const result = await manager.refreshIndices(reader);
+
+	// refreshIndices doesn't return a value (undefined) when changes are made
+	// It only returns false when there are no requests
+	t.is(result, undefined, "refreshIndices returns undefined when it processes changes");
+	t.pass("refreshIndices completed");
+});
+
+// ===== INTEGRATION TESTS =====
+
+test("ResourceRequestManager: Complete workflow", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	// 1. Create manager
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	// 2. Add requests
+	const result = await manager.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	t.truthy(result.signature, "Got signature from addRequests");
+
+	// 3. Get signatures
+	const signatures = manager.getIndexSignatures();
+	t.is(signatures.length, 1, "One signature recorded");
+	t.is(signatures[0], result.signature, "Signature matches");
+
+	// 4. Serialize
+	const cacheObj = manager.toCacheObject();
+	t.truthy(cacheObj, "Can serialize to cache object");
+
+	// 5. Restore from cache
+	const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheObj);
+	t.truthy(manager2, "Can restore from cache");
+
+	const signatures2 = manager2.getIndexSignatures();
+	t.deepEqual(signatures2, signatures, "Restored manager has same signatures");
+});
+
+test("ResourceRequestManager: Differential update workflow", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")]
+	]);
+	const reader = createMockReader(resources);
+
+	// Create with differential updates enabled
+	const manager = new ResourceRequestManager("test.project", "myTask", true);
+
+	// Add requests
+	await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+	// Update resource
+	resources.set("/a.js", createMockResource("/a.js", "hash-a-new"));
+
+	// Update indices
+	const hasChanges = await manager.updateIndices(reader, ["/a.js"]);
+	t.true(hasChanges, "Detected changes");
+
+	// Get deltas
+	const deltas = manager.getDeltas();
+	t.true(deltas instanceof Map, "Has deltas");
+
+	// Serialize
+	const cacheObj = manager.toCacheObject();
+	t.truthy(cacheObj, "Can serialize");
+	t.truthy(cacheObj.deltaIndices, "Has delta indices");
+});
+
+test("ResourceRequestManager: Mixed path and pattern requests", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/src/b.js", createMockResource("/src/b.js", "hash-b")],
+		["/src/c.js", createMockResource("/src/c.js", "hash-c")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const result = await manager.addRequests({
+		paths: ["/a.js"],
+		patterns: [["/src/*.js"]]
+	}, reader);
+
+	t.truthy(result.signature, "Got signature for mixed requests");
+
+	const signatures = manager.getIndexSignatures();
+	t.is(signatures.length, 1, "One signature");
+});
+
+test("ResourceRequestManager: Hierarchical request sets", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")],
+		["/c.js", createMockResource("/c.js", "hash-c")]
+	]);
+	const reader = createMockReader(resources);
+
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	// First request set
+	const result1 = await manager.addRequests({
+		paths: ["/a.js"],
+		patterns: []
+	}, reader);
+
+	// Second request set (superset)
+	const result2 = await manager.addRequests({
+		paths: ["/a.js", "/b.js"],
+		patterns: []
+	}, reader);
+
+	// Third request set (superset)
+	const result3 = await manager.addRequests({
+		paths: ["/a.js", "/b.js", "/c.js"],
+		patterns: []
+	}, reader);
+
+	const signatures = manager.getIndexSignatures();
+	t.is(signatures.length, 3, "Three different signatures");
+	t.not(result1.signature, result2.signature, "Different signatures");
+	t.not(result2.signature, result3.signature, "Different signatures");
+});
+
+test("ResourceRequestManager: Empty request sets", async (t) => {
+	const reader = createMockReader(new Map());
+	const manager = new ResourceRequestManager("test.project", "myTask", false);
+
+	const result = await manager.addRequests({
+		paths: [],
+		patterns: []
+	}, reader);
+
+	t.truthy(result, "Can add empty request set");
+	t.truthy(result.signature, "Has signature even when empty");
+});
+
+test("ResourceRequestManager: Serialization round-trip with multiple request sets", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	// Create manager and add multiple request sets (keep it simpler - two levels)
+	const manager1 = new ResourceRequestManager("test.project", "myTask", false);
+	await manager1.addRequests({paths: ["/a.js"], patterns: []}, reader);
+	await manager1.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+
+	const signatures1 = manager1.getIndexSignatures();
+
+	// Serialize and restore
+	const cacheObj = manager1.toCacheObject();
+	const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheObj);
+
+	const signatures2 = manager2.getIndexSignatures();
+
+	t.deepEqual(signatures2, signatures1, "Signatures preserved through serialization");
+	t.false(manager2.hasNewOrModifiedCacheEntries(), "Restored manager has no new entries");
+});
+
+// ===== UNRESOLVED-READS TESTS =====
+//
+// A task's MonitoredReader records every byPath/byGlob call, including those that
+// return null or []. When a later addRequests recording adds a delta whose
+// requests all resolve to zero resources against the current reader (typical
+// after a branch switch that deletes probed files), the manager still records
+// the request set: its shape influences task output, so it cannot be collapsed
+// onto the parent's cache key.
+//
+// The tests below assert:
+// - #addRequestSet does not throw for empty-resolving deltas.
+// - The exposed signature is distinct from the parent's and from any other
+//   empty-resolving delta.
+// - Once a probed resource appears and updateIndices upserts it, the composite
+//   signature collapses to the pure tree hash, matching the signature a
+//   same-shape recording would have produced with the resource present.
+// - The composite survives toCacheObject / fromCache round-trip.
+
+test("ResourceRequestManager: #addRequestSet with empty-resolving path delta produces distinct signature",
+	async (t) => {
+		const resourcesBefore = new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+		]);
+		const reader = createMockReader(resourcesBefore);
+
+		const manager = new ResourceRequestManager("test.project", "myTask", false);
+		// Parent recording: {/a.js}
+		const parent = await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+		// Probing recording: {/a.js, /c.js}. /c.js does not exist, but MonitoredReader
+		// still recorded the byPath call.
+		const probe = await manager.addRequests({
+			paths: ["/a.js", "/c.js"],
+			patterns: [],
+		}, reader);
+
+		t.truthy(probe.signature, "Empty-resolving delta yields a signature (no throw)");
+		t.not(probe.signature, parent.signature,
+			"Delta signature is distinct from parent's; the probe influences task output");
+
+		const signatures = manager.getIndexSignatures();
+		t.is(signatures.length, 2, "Both request sets are recorded");
+		t.is(signatures[0], parent.signature);
+		t.is(signatures[1], probe.signature);
+	});
+
+test("ResourceRequestManager: #addRequestSet with empty-resolving pattern delta produces distinct signature",
+	async (t) => {
+		const resourcesBefore = new Map([
+			["/src/a.js", createMockResource("/src/a.js", "hash-a")],
+		]);
+		const reader = createMockReader(resourcesBefore);
+
+		const manager = new ResourceRequestManager("test.project", "myTask", false);
+		const parent = await manager.addRequests({paths: ["/src/a.js"], patterns: []}, reader);
+
+		// Recorded byGlob("/test/**/*.js") that matches nothing today.
+		const probe = await manager.addRequests({
+			paths: ["/src/a.js"],
+			patterns: [["/test/**/*.js"]],
+		}, reader);
+
+		t.truthy(probe.signature, "Empty-resolving pattern delta yields a signature");
+		t.not(probe.signature, parent.signature, "Pattern probe changes cache identity");
+	});
+
+test("ResourceRequestManager: two independent empty-resolving deltas produce different signatures",
+	async (t) => {
+		const reader = createMockReader(new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+		]));
+
+		const manager = new ResourceRequestManager("test.project", "myTask", false);
+		await manager.addRequests({paths: ["/a.js"], patterns: []}, reader);
+
+		const probeC = await manager.addRequests({
+			paths: ["/a.js", "/c.js"],
+			patterns: [],
+		}, reader);
+		const probeD = await manager.addRequests({
+			paths: ["/a.js", "/d.js"],
+			patterns: [],
+		}, reader);
+
+		t.not(probeC.signature, probeD.signature,
+			"Different unresolved probes must map to different cache keys");
+	});
+
+test("ResourceRequestManager: signature collapses to tree hash once probed resource resolves",
+	async (t) => {
+		// A: full run against a state where /c.js exists, producing the natural
+		// derived-tree signature the recovering run should converge on.
+		const readerWithC = createMockReader(new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+			["/c.js", createMockResource("/c.js", "hash-c")],
+		]));
+		const managerA = new ResourceRequestManager("test.project", "myTask", false);
+		await managerA.addRequests({paths: ["/a.js"], patterns: []}, readerWithC);
+		const referenceRun = await managerA.addRequests({
+			paths: ["/a.js", "/c.js"],
+			patterns: [],
+		}, readerWithC);
+
+		// B: same recording against a reader where /c.js is missing, then
+		// updateIndices reintroduces it.
+		const readerWithoutC = createMockReader(new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+		]));
+		const managerB = new ResourceRequestManager("test.project", "myTask", false);
+		await managerB.addRequests({paths: ["/a.js"], patterns: []}, readerWithoutC);
+		const probingRun = await managerB.addRequests({
+			paths: ["/a.js", "/c.js"],
+			patterns: [],
+		}, readerWithoutC);
+
+		t.not(probingRun.signature, referenceRun.signature,
+			"Probing recording differs while /c.js is missing");
+
+		// /c.js now appears. updateIndices upserts it into the probing node.
+		const readerNowWithC = createMockReader(new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+			["/c.js", createMockResource("/c.js", "hash-c")],
+		]));
+		await managerB.updateIndices(readerNowWithC, ["/c.js"]);
+
+		const signaturesB = managerB.getIndexSignatures();
+		t.is(signaturesB[1], referenceRun.signature,
+			"Once the probe resolves, the composite signature collapses to the natural tree hash");
+	});
+
+test("ResourceRequestManager: unresolved-requests marker survives toCacheObject / fromCache",
+	async (t) => {
+		const reader = createMockReader(new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+		]));
+
+		const manager1 = new ResourceRequestManager("test.project", "myTask", false);
+		await manager1.addRequests({paths: ["/a.js"], patterns: []}, reader);
+		const probe = await manager1.addRequests({
+			paths: ["/a.js", "/c.js"],
+			patterns: [],
+		}, reader);
+		const signaturesBefore = manager1.getIndexSignatures();
+
+		const cacheObj = manager1.toCacheObject();
+		const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheObj);
+
+		const signaturesAfter = manager2.getIndexSignatures();
+		t.deepEqual(signaturesAfter, signaturesBefore,
+			"Signatures survive the cache round-trip bit-for-bit");
+		t.is(signaturesAfter[1], probe.signature,
+			"Probing signature is preserved");
+	});
+
+test("ResourceRequestManager: fully empty root recording gets a distinguished signature",
+	async (t) => {
+		// Two independent tasks that both recorded reads to files that don't exist
+		// must not collide on the same "dir::empty" tree constant.
+		const emptyReader = createMockReader(new Map());
+
+		const managerA = new ResourceRequestManager("test.project", "taskA", false);
+		const runA = await managerA.addRequests({paths: ["/only-in-A.js"], patterns: []}, emptyReader);
+
+		const managerB = new ResourceRequestManager("test.project", "taskB", false);
+		const runB = await managerB.addRequests({paths: ["/only-in-B.js"], patterns: []}, emptyReader);
+
+		t.not(runA.signature, runB.signature,
+			"Distinct root recordings with all-unresolved reads produce distinct signatures");
+	});
+
+test("ResourceRequestManager: BuildStageCache-shape flow with unresolved probe (integration-ish)",
+	async (t) => {
+		// Mirrors what BuildStageCache.recordRequests does with two consecutive
+		// addRequests recordings that share a parent but differ by one probed path.
+		const readerBefore = createMockReader(new Map([
+			["/a.js", createMockResource("/a.js", "hash-a")],
+			["/b.js", createMockResource("/b.js", "hash-b")],
+		]));
+
+		const manager = new ResourceRequestManager("test.project", "myTask", true);
+
+		// First recording produces a valid parent.
+		const first = await manager.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, readerBefore);
+
+		// Second recording adds an unresolvable byPath.
+		const second = await manager.addRequests({
+			paths: ["/a.js", "/b.js", "/optional.json"],
+			patterns: [],
+		}, readerBefore);
+
+		t.truthy(second.signature, "Second recording completes without throwing");
+		t.not(second.signature, first.signature, "Cache key reflects the extra probe");
+
+		// hasNewOrModifiedCacheEntries stays true for a fresh manager.
+		t.true(manager.hasNewOrModifiedCacheEntries());
+	});
+
+test("ResourceRequestManager: Serialization round-trip with multiple request sets and following update", async (t) => {
+	const resources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")],
+		["/b.js", createMockResource("/b.js", "hash-b")]
+	]);
+	const reader = createMockReader(resources);
+
+	// Create manager and add multiple request sets (keep it simpler - two levels)
+	const manager1 = new ResourceRequestManager("test.project", "myTask", false);
+	await manager1.addRequests({paths: ["/a.js"], patterns: []}, reader);
+	await manager1.addRequests({paths: ["/a.js", "/b.js"], patterns: []}, reader);
+
+	const signatures1 = manager1.getIndexSignatures();
+
+	// Serialize and restore
+	const cacheObj = manager1.toCacheObject();
+	const manager2 = ResourceRequestManager.fromCache("test.project", "myTask", false, cacheObj);
+
+
+	const changedResources = new Map([
+		["/a.js", createMockResource("/a.js", "hash-a")], // Identical to first
+		["/b.js", createMockResource("/b.js", "hash-y")]
+	]);
+	const changedReader = createMockReader(changedResources);
+
+	const hasChanges = await manager2.updateIndices(changedReader, ["/a.js", "/b.js"]);
+
+	t.true(hasChanges, "Detected changes after update");
+
+	const signatures2 = manager2.getIndexSignatures();
+
+	t.is(signatures2[0], signatures1[0], "Unchanged signature of first request set");
+	t.not(signatures2[1], signatures1[1], "Changed signature of second request set");
+	t.true(manager2.hasNewOrModifiedCacheEntries(), "Restored manager has new entries");
+});
+
+
+test("ResourceRequestManager: clear() empties the manager and flags it for re-persistence", async (t) => {
+	const manager = new ResourceRequestManager("test.project", "myStage#root", false);
+	const reader = createMockReader(new Map([["/tsconfig.json", createMockResource("/tsconfig.json")]]));
+	await manager.addRequests({paths: ["/tsconfig.json"], patterns: []}, reader);
+
+	t.true(manager.hasRequests(), "Manager has requests after recording");
+	t.true(manager.getIndexSignatures().length > 0, "A recorded request yields a signature");
+	t.false(manager.wasCleared(), "A manager that recorded requests was not cleared");
+
+	manager.clear();
+
+	t.false(manager.hasRequests(), "clear() empties the manager");
+	t.deepEqual(manager.getIndexSignatures(), [], "No signatures remain after clear()");
+	t.true(manager.wasCleared(), "wasCleared() reports the manager was cleared");
+	t.true(manager.hasNewOrModifiedCacheEntries(), "A cleared manager is marked for re-persistence");
+	t.truthy(manager.toCacheObject(), "A cleared manager serializes its now-empty state to overwrite the stored one");
+});
+
+test("ResourceRequestManager: wasCleared() is false for a fresh and a restored manager", (t) => {
+	t.false(new ResourceRequestManager("test.project", "myStage#root", false).wasCleared(),
+		"A fresh manager was not cleared");
+	const restored = ResourceRequestManager.fromCache("test.project", "myStage#root", false,
+		{requestSetGraph: {nodes: [], nextId: 1}, rootIndices: [], deltaIndices: []});
+	t.false(restored.wasCleared(), "A restored manager was not cleared");
+});

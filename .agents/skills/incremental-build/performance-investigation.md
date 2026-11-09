@@ -1,0 +1,496 @@
+# Performance Investigation Guide
+
+Reference for investigating and analyzing performance of the incremental build system.
+
+## Test Setup
+
+### Test library
+
+Use sap.m from the OpenUI5 repository. It's a large library (~12,700 source resources) with 3 dependency projects (sap.ui.core, sap.ui.layout, sap.ui.unified) and 9 build tasks, making it a good stress test.
+
+### Build command
+
+```bash
+# Within openui5/src/sap.m:
+UI5_CLI_NO_LOCAL=X UI5_BUILD_NO_WRITE_DEST=X UI5_CACHE_PERF=1 ui5 build --log-level perf 2>&1
+```
+
+Flags:
+- `UI5_CLI_NO_LOCAL=X` — Use the globally linked CLI (i.e., the development version)
+- `UI5_BUILD_NO_WRITE_DEST=X` — Skip writing output to `./dist` (isolates cache/build overhead from disk I/O)
+- `UI5_CACHE_PERF=1` — Enable low-level `isResourceUnchanged` counters (see below)
+- `--log-level perf` — Show all perf-level log statements
+
+### Three build scenarios
+
+| Scenario | How to trigger | What it tests |
+|----------|---------------|---------------|
+| **Cold cache** | Delete `~/.ui5/buildCache/` and run | Full build + cache creation from scratch |
+| **Warm cache** | Run twice with no file changes | Cache validation + result restoration |
+| **Stale cache** | Edit a file, then run | Cache invalidation + partial rebuild |
+
+**Creating a stale cache scenario:**
+Change a variable value inside a JS file (do NOT replace the first line — if it contains a license comment or `/*!`, replacing it can break minification):
+```bash
+# Within openui5/src/sap.m:
+sed -i '' 's/BADGE_MAX_VALUE = 9999;/BADGE_MAX_VALUE = 9998;/' src/sap/m/Button.js
+```
+Then run the build command. Restore with `git checkout -- src/sap/m/Button.js` when done.
+
+## Performance Logging API
+
+The `@ui5/logger` package provides a `perf` log level for performance instrumentation. This is the primary mechanism for adding timing measurements to build code.
+
+### Log levels (least to most restrictive)
+
+`silly` → `verbose` → `perf` → `info` (default) → `warn` → `error` → `silent`
+
+Setting `--log-level perf` shows `perf`, `info`, `warn`, and `error` messages. At the default `info` level, `perf` messages are suppressed.
+
+### Usage pattern
+
+```javascript
+import {getLogger} from "@ui5/logger";
+const log = getLogger("build:cache:MyModule");
+
+// Guard expensive timing computation behind isLevelEnabled
+if (log.isLevelEnabled("perf")) {
+	log.perf(`Operation completed in ${(performance.now() - start).toFixed(2)} ms`);
+}
+```
+
+Key points:
+- **Always guard with `log.isLevelEnabled("perf")`** when the log message involves computation (e.g., `performance.now()` calls, string interpolation with counts). Without the guard, the timing overhead runs even at default log level.
+- `log.perf(msg)` works like `log.info(msg)` — accepts any number of arguments, joins them with spaces.
+- `log.isLevelEnabled(level)` is a static check comparing the requested level's index against the current global level.
+- Logger names use colon-separated namespaces (e.g., `"build:cache:ProjectBuildCache"`).
+
+### Enabling perf logging
+
+Two CLI options (defined in `packages/cli/lib/cli/base.js`):
+- `--log-level perf` — Set log level directly
+- `--perf` — Shorthand boolean flag, equivalent to `--log-level perf`
+
+### Adding new perf instrumentation
+
+Standard pattern for timing a code section:
+
+```javascript
+const start = log.isLevelEnabled("perf") ? performance.now() : 0;
+// ... operation to measure ...
+if (log.isLevelEnabled("perf")) {
+	log.perf(`Operation X for project ${name} completed in ${(performance.now() - start).toFixed(2)} ms`);
+}
+```
+
+When the guarded block is large or complex, prefer the two-check pattern above. For simple one-liners where the start timestamp is cheap, a single check around the log call suffices.
+
+## Reading the Perf Log
+
+The log follows the build lifecycle. Here is the anatomy of a stale-cache build:
+
+### Phase 1: Source Index Initialization (parallel across all projects)
+
+```
+perf #initSourceIndex fromCacheWithDelta for project sap.m completed in 68 ms: 12677 resources, 1 changed
+perf Initialized source index for project sap.m in 691 ms
+```
+
+- The first line shows the delta detection: how many resources exist and how many changed.
+  A high `changed` count with few actual edits suggests a timestamp-related false positive.
+- The total init time includes `byGlob("/**/*")` (stat all files), reading the cached index from disk, and delta detection. The `fromCacheWithDelta` time is a subset of the total.
+- If `fromCacheWithDelta` is small relative to total, the bottleneck is in the glob (reading file metadata from disk). If `fromCacheWithDelta` is large, the bottleneck is in hashing.
+
+### Phase 2: Per-project cache validation (sequential)
+
+Each project goes through this sequence:
+
+```
+perf getDependenciesReader completed in 0.12 ms
+perf Initialized dependency indices for project sap.ui.core in 0.63 ms
+   OR
+perf Skipping dependency index refresh for project sap.ui.core (no dependency changes propagated)
+   OR
+perf #flushPendingChanges updateDependencyIndices for project sap.ui.layout completed in 61 ms (3064 changed paths, 2/10 tasks, changed=true)
+perf Flushed pending changes for project sap.ui.layout in 61 ms
+```
+
+- **"Initialized dependency indices"** → first-time dependency index refresh (`_refreshDependencyIndices`). Runs when dependency changes were propagated from upstream projects.
+- **"Skipping dependency index refresh"** → no dependency changes were propagated; cached indices are already correct.
+- **"#flushPendingChanges"** → updating existing indices with changed paths (BuildServer subsequent builds). The `N/M tasks` shows how many tasks had dependency requests vs. total. The `changed paths` count is the number of dependency resource paths propagated as potentially changed.
+
+Then result cache validation:
+
+```
+perf #findResultCache importStages for project sap.ui.core completed in 7 ms with 10 stages
+perf #findResultCache restoreFrozenSources for project sap.ui.core completed in 5 ms
+perf Validated result cache for project sap.ui.core in 13 ms
+```
+
+- `importStages` — Loads cached stage readers from CAS for each task.
+- `restoreFrozenSources` — Creates a CAS-backed reader for source files.
+- The overall line tells you if the result cache was valid.
+
+After validation:
+
+```
+perf validateCache for sap.ui.core completed in 34 ms (usesCache=true)
+info ✔ Skipping build of library project sap.ui.core
+   OR
+perf validateCache for sap.m completed in 0.48 ms (usesCache=false)
+info ❯ Building library project sap.m...
+```
+
+- `usesCache=true` → Project is fully served from cache, skip all tasks.
+- `usesCache=false` → Project needs (re-)building, tasks will be evaluated individually.
+
+### Phase 3: Task execution (for projects that need building)
+
+Per-task index update:
+
+```
+perf updateIndices for task 'replaceVersion' of project 'sap.m' resource fetch completed in 3.89 ms: 0 cache hits, 783 cache misses
+perf TreeRegistry.flush completed: phase1(removals)=0.00 ms, phase2(upserts)=7.13 ms, phase3(rehash)=9.56 ms | isUnchangedCalls=783, isUnchangedHits=782, modifiedNodesSkips=0
+perf #flushTreeChanges for task 'replaceVersion' completed in 16.79 ms across 1 registries
+perf Updated project indices for task replaceVersion in project sap.m in 21.71 ms
+```
+
+Key metrics:
+- **cache hits / cache misses**: In the resource fetch, "cache hits" means the resource was already in the task's request index (from a previous task sharing the same tree). "Cache misses" means a new fetch was needed.
+- **phase1(removals)**: Time removing deleted resources from the Merkle tree.
+- **phase2(upserts)**: Time inserting/updating resources in the tree.
+- **phase3(rehash)**: Time propagating hash changes up from modified leaves to root. High rehash with few changed resources indicates deep tree structure.
+- **isUnchangedCalls / isUnchangedHits**: How many resources were compared, and how many were unchanged (short-circuited by lastModified check). If `calls >> hits`, many resources needed content hashing.
+
+Then task execution or skip:
+
+```
+info ✔ Skipping task escapeNonAsciiCharacters     ← Cache hit
+info ◇ Running task replaceCopyright...             ← Delta/differential run
+info › Running task generateLibraryPreload...       ← Full re-execution
+```
+
+- `✔ Skipping` — exact cache match for this task's signature.
+- `◇ Running` — a step-based task where at least one step re-ran (`StepRunner` selects the changed steps/keys), or a legacy task running a delta (`cacheInfo`).
+- `› Running` — full execution (no cache match, no delta available).
+
+After task execution, `recordTaskResult` runs (logged per task):
+
+```
+perf recordTaskResult delta merge for task replaceCopyright in project sap.m completed in 6.67 ms (783 previous, 782 merged)
+perf recordTaskResult for task replaceCopyright in project sap.m completed in 7.22 ms (1 written resources, delta=true)
+```
+
+### Phase 3b: Build finalization (`allTasksCompleted`)
+
+After all tasks complete, `allTasksCompleted()` runs two operations:
+
+```
+perf #revalidateSourceIndex byGlob for project sap.m completed in 284.91 ms (12677 resources)
+perf allTasksCompleted #revalidateSourceIndex for project sap.m completed in 326.33 ms (changed=false)
+perf #freezeUntransformedSources for project sap.m: reused all 11821 entries from previous metadata
+perf allTasksCompleted #freezeUntransformedSources for project sap.m completed in 30.95 ms
+perf allTasksCompleted for project sap.m completed in 357.45 ms (2235 changed paths)
+```
+
+Key metrics:
+- **`#revalidateSourceIndex` byGlob**: Time to re-read all source file metadata from disk. I/O-bound.
+- **`#revalidateSourceIndex` total**: Includes metadata comparison loop. If much larger than byGlob, the comparison is expensive (racy-git fallback to integrity check).
+- **`#freezeUntransformedSources` metadata reuse**: When `#cachedFrozenSourceMetadata` is populated (stale cache), untransformed paths found in the previous metadata are reused directly with no I/O. The log shows "reused all N entries" for the fast path, or "M of N resources" for the delta path (where M paths needed re-reading).
+- **`#freezeUntransformedSources` byPath reads**: Only shown when some paths need reading (delta or cold-cache path). Format: `(M of N resources)` for delta, `(N resources)` for cold cache.
+- **`#freezeUntransformedSources` writeStageResources**: Only shown when `byPath` reads are needed. Time to write delta resources to CAS and collect metadata.
+- **CAS skipped / CAS written**: Shows how many resources had their CAS write skipped because `#knownCasIntegrities` already contained the integrity hash.
+
+### Phase 4: Cache write
+
+In CLI builds, cache writes are **deferred** — they run in the background after `Build succeeded` is printed and don't block process exit. In BuildServer mode, cache writes are still awaited.
+
+```
+info ProjectBuilder Build succeeded in 5.04 s
+info ProjectBuilder Executing cleanup tasks...
+perf Wrote build cache for project sap.m in 301 ms
+```
+
+The four sub-operations (stages, requests, sourceIndex, result) run in parallel (`Promise.all`), so wall time ≈ max of all four. When run in the background (CLI), they no longer compete with the build for I/O bandwidth and typically complete faster (~300ms vs ~1400ms when blocking).
+
+**Important:** The source stage CAS write (`#freezeUntransformedSources`) is NOT part of Phase 4. It runs during `allTasksCompleted()` in Phase 3b, before `Build succeeded` is logged. For sap.m this processes ~11,821 untransformed source resources. Look for the `#freezeUntransformedSources` and `allTasksCompleted #freezeUntransformedSources` log lines — they appear before `Build succeeded`. In the stale-cache scenario this takes ~31ms (metadata reused from previous build via `#cachedFrozenSourceMetadata`). In the cold-cache scenario it takes ~8s because there is no previous metadata and every resource requires `byPath()` + a CAS existence check via `BuildCacheStorage.hasContent()` (see Known Peculiarities #7).
+
+## UI5_CACHE_PERF Counters
+
+Setting `UI5_CACHE_PERF=1` enables low-level counters in `utils.js` for `isResourceUnchanged`:
+
+- `calls` — Total invocations
+- `shortCircuitTrue` — Fast-path returns (lastModified matches cached and ≠ indexTimestamp → file unchanged, no I/O needed)
+- `sizeMismatch` — Changes detected via size check (cheap)
+- `inodeMismatch` — File replacement detected via inode change (forces integrity check)
+- `integrityFallback` — Full SHA256 content hash required (expensive)
+
+These counters are tallied per-flush in `TreeRegistry.flush` as `isUnchangedCalls` and `isUnchangedHits`.
+
+A high `integrityFallback` count means many files have the same size but different content — this is expensive and may indicate that the `lastModified` short-circuit is not working (e.g., due to timestamp resolution issues).
+
+## Perf Log Reference
+
+All `log.perf()` statements by source file:
+
+| File | Log pattern | What it measures |
+|------|-------------|------------------|
+| `BuildContext.js` | `Parallel source index initialization completed` | Total time for parallel `initSourceIndex` across all projects |
+| `BuildContext.js` | `getRequiredProjectContexts completed` | Discovery + index init for all required projects |
+| `ProjectBuildContext.js` | `getDependenciesReader completed` | Creating the dependency reader for a project |
+| `ProjectBuildContext.js` | `ProjectBuildCache.validateCache completed` | Full cache validation for one project |
+| `ProjectBuilder.js` | `getRequiredProjectContexts completed` | Top-level timing (includes context creation) |
+| `ProjectBuilder.js` | `validateCache for {project} completed` | Per-project validation with `usesCache` flag |
+| `TaskRunner.js` | `Task {name} finished in {N} ms` | Individual task execution time |
+| `ProjectBuildCache.js` | `#initSourceIndex fromCacheWithDelta` | Delta detection: resource count, changed count |
+| `ProjectBuildCache.js` | `Initialized source index for project` | Total source index init (glob + cache read + delta) |
+| `ProjectBuildCache.js` | `Initialized dependency indices` | First-time dependency index refresh |
+| `ProjectBuildCache.js` | `Skipping dependency index refresh` | Cached indices reused without refresh |
+| `ProjectBuildCache.js` | `Flushed pending changes for project` | Source + dependency index update with pending changes |
+| `ProjectBuildCache.js` | `#flushPendingChanges updateSourceIndex` | Source index update only |
+| `ProjectBuildCache.js` | `#flushPendingChanges updateDependencyIndices` | Dependency index update with task/path counts |
+| `ProjectBuildCache.js` | `#importStages: Initial import` | First-time stage import with suppressed propagation count |
+| `ProjectBuildCache.js` | `#findResultCache importStages` | Loading cached stages from CAS |
+| `ProjectBuildCache.js` | `#findResultCache restoreFrozenSources` | Creating CAS-backed source reader |
+| `ProjectBuildCache.js` | `Validated result cache for project` | Overall result cache validation |
+| `ProjectBuildCache.js` | `Updated project indices for task` | Per-task index update during build |
+| `ProjectBuildCache.js` | `#writeStageResources for stage` | CAS write with skipped/written counts |
+| `ProjectBuildCache.js` | `Wrote build cache for project` | Cache persistence with sub-operation breakdown |
+| `ProjectBuildCache.js` | `allTasksCompleted for project` | Total time for allTasksCompleted including revalidation and source freeze |
+| `ProjectBuildCache.js` | `allTasksCompleted #revalidateSourceIndex` | Source file revalidation (checks no files changed during build) |
+| `ProjectBuildCache.js` | `allTasksCompleted #freezeUntransformedSources` | Writing untransformed source files to CAS |
+| `ProjectBuildCache.js` | `#revalidateSourceIndex byGlob` | Re-reading all source files for revalidation |
+| `ProjectBuildCache.js` | `#freezeUntransformedSources ... reused all N entries` | Fast path: all metadata reused from previous build |
+| `ProjectBuildCache.js` | `#freezeUntransformedSources byPath reads` | Reading only delta untransformed source files |
+| `ProjectBuildCache.js` | `#freezeUntransformedSources writeStageResources` | CAS writes during source freeze (delta or cold cache) |
+| `ProjectBuildCache.js` | `recordTaskResult for task` | Total time to record task result including merge/signature |
+| `ProjectBuildCache.js` | `recordTaskResult delta merge` | Merging previous stage cache with delta results |
+| `ProjectBuildCache.js` | `recordTaskResult recordRequests` | Recording resource requests and building hash trees |
+| `ResourceRequestManager.js` | `refreshIndices for task` | Full dependency index refresh |
+| `ResourceRequestManager.js` | `updateIndices for task ... resource fetch` | Resource fetch phase with cache hit/miss counts |
+| `ResourceRequestManager.js` | `#flushTreeChanges for task` | Merkle tree flush with registry count |
+| `TreeRegistry.js` | `TreeRegistry.flush completed` | Detailed tree operation breakdown (removals/upserts/rehash) |
+
+## Known Peculiarities
+
+### 1. Source index init dominated by byGlob, not delta detection
+
+For sap.m: `fromCacheWithDelta` takes ~68ms but the total `Initialized source index` takes ~691ms. The remaining ~620ms is `sourceReader.byGlob("/**/*")` which stats all ~12,677 files. The delta detection itself (comparing metadata, hashing only changed files) is fast.
+
+**Implication:** Source index init performance is I/O-bound (filesystem stat calls), not CPU-bound. Optimizations targeting hash computation won't help much; reducing the number of stat calls would.
+
+**Validated (2026-04):** Replacing `byGlob("/**/*")` with `fs.readdir(recursive)` + per-file `fs.stat()` using lightweight proxy objects (avoiding Resource construction) was tested and produced a ~300ms *regression* for sap.m. Both approaches must stat every file; globby integrates stat into its directory walk more efficiently than a separate readdir + 12K stat calls. The only way to meaningfully reduce source index init time is to **avoid statting unchanged files entirely** (e.g., via directory mtime heuristics or filesystem change notifications).
+
+### 2. "cache misses" in resource fetch don't mean cache corruption
+
+In `updateIndices` logs, "cache misses" means the resource wasn't found in the task's SharedHashTree node cache (a performance optimization for avoiding redundant metadata reads). It does NOT mean the persistent cache is missing. On the first build from cache, all resources are "cache misses" because the in-memory node cache starts empty.
+
+### 3. Task execution appears twice in the log
+
+```
+perf Build Task replaceCopyright finished in 1 ms
+perf Build Task replaceCopyright finished in 8 ms
+```
+
+The first line is the task function's execution time. The second includes cache recording overhead (computing signatures, recording resource requests). This is the wall time from the TaskRunner's perspective.
+
+### 4. writeCache sub-timings all look similar because of Promise.all
+
+```
+perf Wrote build cache ... (stages=1422 ms, requests=1427 ms, sourceIndex=1395 ms, result=1381 ms)
+```
+
+These four operations run in parallel. They share I/O bandwidth, so their individual timings overlap. The wall time is ~max of all four, not the sum. To identify the true bottleneck, you'd need to run them sequentially (temporarily modify `writeCache`).
+
+**Note:** In CLI mode, cache writes are deferred to the background. The `Wrote build cache` log line appears after `Build succeeded`. The sub-timings tend to be lower (~250-300ms vs ~1400ms) because background writes don't compete with the build for I/O bandwidth.
+
+### 5. isUnchangedHits vs modifiedNodesSkips
+
+In `TreeRegistry.flush` logs:
+- `isUnchangedHits` — Resources whose metadata (lastModified, size, integrity) matched the cached version. No tree modification needed.
+- `modifiedNodesSkips` — Tree nodes already marked as modified by a previous flush in the same build. Skipped to avoid redundant work.
+
+When `isUnchangedHits` equals `isUnchangedCalls`, ALL resources were unchanged — the flush was pure overhead.
+
+### 6. Dependency index "changed=true" doesn't always mean task re-execution
+
+The `changed=true` in `#flushPendingChanges updateDependencyIndices` means at least one dependency index signature changed. But the *result* cache validation (`#findResultCache`) may still find a matching cached result if the combined project+dependency signature matches a previous build.
+
+### 7. `#freezeUntransformedSources` CAS overhead varies dramatically by scenario
+
+`#freezeUntransformedSources` writes untransformed source files to CAS and collects metadata. Its cost depends on two factors: whether `#knownCasIntegrities` contains the resource integrities (CAS skip), and whether `#cachedFrozenSourceMetadata` contains previous metadata for reuse (delta skip).
+
+| Scenario | `#knownCasIntegrities` state | `#cachedFrozenSourceMetadata` state | `#freezeUntransformedSources` time (sap.m) | Why |
+|----------|------------------------------|--------------------------------------|---------------------------------------------|-----|
+| **Stale cache** | Populated from cached source stage | Populated from cached source stage | ~31ms | All entries reused from previous metadata; only JSON write |
+| **Cold cache** | Empty (no `indexCache`) | null | ~8s | Every resource: `byPath()` + `BuildCacheStorage.hasContent()` + `getBuffer()` + gzip + `BuildCacheStorage.writeContent()` |
+| **Warm cache** | N/A (result cache valid, freeze skipped) | N/A | 0 | `#findResultCache` succeeds, `#restoreFrozenSources` used instead |
+
+**History:** Before the `#knownCasIntegrities` pre-population fix (2026-04), stale-cache builds suffered the ~10s cold-cache penalty because the set was not populated from the source index. The fix populates the set during `#initSourceIndex` from the cached source stage metadata.
+
+Subsequently, the delta freeze optimization (2026-04) added `#cachedFrozenSourceMetadata`: during `#initSourceIndex`, the previous build's frozen source `resourceMetadata` is retained. In `#freezeUntransformedSources`, untransformed paths found in the previous metadata are reused directly (no `byPath()`, no `getIntegrity()`, no CAS write). Only genuinely new or newly-untransformed files require I/O. For the common stale-cache case (1 file changed), all ~11,821 untransformed entries are reused, reducing freeze time from ~1.2s to ~31ms.
+
+**Cold-cache CAS write breakdown:** On cold cache, each resource that doesn't exist in CAS incurs: `getIntegrity()` (hash computation), `BuildCacheStorage.hasContent()` (SQLite existence check), `getBuffer()` (read file), `gzipSync()` (compression for content above the threshold), `BuildCacheStorage.writeContent()` (SQLite insert). For ~12K resources this totals ~8s. This is a one-time cost since subsequent stale-cache builds reuse frozen metadata entirely.
+
+### 8. `recordTaskResult` overhead is small for delta builds
+
+In delta builds, `recordTaskResult()` is called after each task but is fast (~2-15ms per task). The main cost is the delta merge (`reader.byGlob("/**/*")` on the previous stage cache), which scales with the number of resources in the cached stage. For the minify task (2,193 resources), the merge takes ~13ms.
+
+For full (non-delta) task re-execution, `recordRequests()` is called instead, which is also fast (~0.2ms) because the hash tree building is deferred to the next task's `prepareTaskExecutionAndValidateCache`.
+
+### 9. Cache writes are fast in background mode
+
+When cache writes are deferred (CLI mode), `#writeTaskStageCache` + `#writeSourceIndex` + `#writeResultCache` complete in ~60ms total because `#knownCasIntegrities` was populated during `#freezeUntransformedSources`, allowing CAS skip for most resources.
+
+### 10. `#knownCasIntegrities` population sources
+
+`#knownCasIntegrities` is a `Set<string>` that tracks integrity hashes known to exist in CAS. When `#writeStageResources` encounters an integrity in this set, it skips the `BuildCacheStorage.hasContent()` lookup entirely. The set is populated from three sources:
+
+1. **Source index cache** (in `#initSourceIndex`): When loading from `indexCache`, all resource integrities from the Merkle tree are added. These correspond to resources written to CAS by the previous build's `#freezeUntransformedSources`.
+2. **Imported stage metadata** (in `#importStageMetadata` via `#collectKnownIntegrities`): When restoring cached task stages (e.g., for dependency projects or result cache hits), the resource integrities from stage metadata are added.
+3. **Newly written stages** (in `#writeTaskStageCache` / `#freezeUntransformedSources` via `#collectKnownIntegrities`): After writing stage resources, the metadata integrities are added for subsequent stage writes.
+
+When diagnosing slow `writeStageResources`, check the `CAS skipped` vs `CAS written` counts in the log. If most resources are being written (not skipped), `#knownCasIntegrities` is not being populated from one of these sources — trace which source is missing for the scenario.
+
+### 11. Do not parallelize `isResourceUnchanged` with `Promise.all`
+
+`HashTree.upsertResources` and `TreeRegistry.flush` call `isResourceUnchanged` (`utils.js`) per resource, which checks `lastModified`/`size` (sync) first and only reads and hashes the file (`getIntegrity()`) when that fast path fails (see the tiered comparison in `architecture.md`). On an incremental build most resources are unchanged, so the common path is synchronous. Wrapping these calls in `Promise.all` either forces `getIntegrity()` for every resource (a regression) or adds promise overhead to hundreds of synchronously-resolving checks (no gain). Initial builds already parallelize through `createResourceIndex`. Before parallelizing I/O here, confirm the short-circuit does not already make the common path synchronous, and benchmark before and after.
+
+### 12. `StepRunner.#keyId` must not force the content hash per enumerated key
+
+`StepRunner.#resolveEntries` computes a key identity (`#keyId`) for every key a map step enumerates, via `Promise.all`, **before** delta selection runs. If `#keyId` derives that identity from the SSRI integrity, it reads and hashes every enumerated key's full content on every build — the same force-the-hash trap as §11, but one tier up (per enumerated key rather than per index resource). This bites hardest on a step whose keys come from a broad `workspace.byGlob` resolving straight to the project source reader (`replaceCopyright`, `replaceVersion`), where the key set is the whole source tree and the resources carry `lastModified`+`size` from statInfo but no `#integrity` (the `FileSystem` adapter never sets it), so `getIntegrity()` reads the file. A step whose keys come from a stage cache (`minify`) is already cheap because those resources carry `integrity`.
+
+`#keyId` therefore tiers the identity like `isResourceUnchanged`: `lastModified`+`size` when both are statically available (`getLastModified()` is a number and `hasSize()` is true, no content read), integrity only as the fallback (memory/generated resources with no `lastModified`, or no static size; and stage-cache resources, whose `getIntegrity()` is cached and so stays cheap). See the key-identity paragraph under "Step-Based Build Tasks" in `architecture.md` for the correctness argument and the residual mtime+size-preserving risk.
+
+**Measured (2026-10, stale-cache sap.m, one source file edited, instrumenting `#resolveEntries` per step):**
+
+| Step | keys | integrity tier (before) | lastModified+size tier (after) |
+|------|------|-------------------------|--------------------------------|
+| `replaceCopyright` | 4411 | ~210–375 ms | ~4 ms |
+| `replaceVersion` | 5292 | ~196–227 ms | ~2 ms |
+| `minify` | 737 | ~0.5 ms (already cheap, stage-cache keys carry integrity) | ~0.2 ms |
+
+`#resolveEntries` across the two broad-glob steps dropped from ~420–600 ms (first-run fs-cache-cold spike at the top of the range) to ~6 ms — the per-key `ssri.fromData` disappears from the stale-cache critical path. Total stale-cache sap.m build time: ~3.2 s → ~2.4 s. Warm cache is unaffected (the result cache is valid, so `#resolveEntries` is never reached), and cold cache is unaffected (integrity is already computed during indexing).
+
+### 13. The delta-build step fold is already cheap; dedup is hygiene, not a speedup
+
+The step fold on the delta path (`StepRunner.#foldStageKeys` → `recordStage`'s `foldReadsInto` → `ProjectBuildCache.#foldStepReads` → `BuildStageCache.recordRequests` → `ResourceRequestManager.addRequests`) was reviewed as a suspected delta-path cost: a `minify` fold of ~4,400 duplicated per-key paths, and a `findExactMatch` iterating every node and re-resolving every path on a miss. **Measured at HEAD (2026-10, stale-cache sap.m), that cost does not materialize**, because an earlier branch commit stopped the broad map steps from recording per-key reads: `minify`/`replaceCopyright`/`replaceVersion` operate on the key resource `keys()` hands them, not via `workspace.byPath`, so each key records **zero** reads and the fold is empty. The only standard step that folds real per-key reads is `buildThemes` (its `each` reads dependencies per theme), and only when a theme source changes.
+
+Instrumenting `#foldStageKeys` (raw vs unique paths), `#foldStepReads` (per-stage timing), `findExactMatch` (calls, request keys built, reuse vs miss) and `#prepareStageRequestCache` (dirty vs clean stages, spurious reuse-dirty flags):
+
+| Scenario (one file edited) | fold per stage | `findExactMatch` | request keys built | stages re-serialized |
+|---|---|---|---|---|
+| JS file (`Button.js`) | ~0.1 ms, 0 fold paths | 5 calls, 5 iterations, **0 misses** | 7 → 7 (no change) | unchanged |
+| Theme file (`base/Bar.less`, drives `buildThemes`) | ~0.4 ms, 2 dup / 443 paths | 5 calls, 5 iterations, **0 misses** | **647 → 454** | **1 fewer** |
+
+Findings:
+- **Every `findExactMatch` is a reused hit (0 misses).** The feared miss path (`#getResourcesForRequests` resolving each recorded path through the reader stack and rebuilding the hash tree) is never reached on this corpus, so there is no path-resolution cost to shrink today. Dedup only shrinks the input *to* a miss, which does not occur here.
+- **Dedup win is request-key string building only.** `#foldStageKeys` deduping into `Set`s plus `foldReadsInto` dropping fold paths the stage monitor already requested cut the keys `findExactMatch` rebuilds from 647 to 454 on a theme change (`buildThemes`' ~2 duplicate reads plus the per-key paths double-counted against the stage monitor). This is microseconds; it does not move wall-clock on a ~2.4 s build.
+- **The dirty-flag fix (W5) is the one with latent value.** `ResourceRequestManager.#addRequestSet` previously flagged the manager dirty on *every* call, so a request set reused byte-identical still forced the whole request graph + resource indices to be re-serialized. The common case for a step-based stage is recording the same set every delta build; measured `spuriousReuseDirty=1` on the theme scenario (one stage's request cache needlessly rewritten), 0 after the fix. In CLI mode this is a deferred background write off the critical path; it matters more in **BuildServer mode, where cache writes are awaited** (Phase 4), so cutting re-serialized stages directly shortens the awaited write.
+
+**Verdict: no measurable build-time speedup on the common path.** The value is correctness/hygiene (reused-unchanged no longer marks dirty; the fold is a clean deduped `Set` union, not an array concat the review's "no-op union" comment misdescribed) plus headroom for custom step-based tasks whose `each` reads per key (where the fold would otherwise carry key-count × reads-per-key duplicates) and for the awaited-write BuildServer path. The scope was deliberately kept to dedup + the dirty-flag fix (C8 answered: not worth an incrementally-maintained union); `foldReadsInto` dedups exact paths only and does not reason about pattern coverage (a dropped-pattern-coverage variant was prototyped — ~629 → ~442 on the theme change — then dropped as unjustified complexity for a sub-ms win). The larger latent lever (avoiding the per-path `byPath` on a `findExactMatch` miss) is untouched and out of scope.
+
+### 14. One stage per step costs no extra stages for an OpenUI5 library
+
+The one-stage-per-step design was reviewed as the suspected structural cause of the branch building slower than `main`. Measured, it is not. Count stages from the perf log (`importStages ... with N stages`, or the unique `task/...::step/...` ids) and compare `main` to this branch for a `ui5 build` and a `ui5 build --all`: a library builds with the same stage count on both. Every shipped step-based task (`minify`, `buildThemes`, the three `replace*`, `escapeNonAsciiCharacters`, `enhanceManifest`) is single-step, and `generateThemeDesignerResources` (the only multi-step task, three steps) is not in the default library task set, so step count equals task count. A single-step task already is exactly one stage, so collapsing it to `task/{taskName}` removes no stage, leaves `StepRunner`'s per-key machinery in place, and was measured and rejected as a pure stage-id rename. Per-stage `updateProjectIndices` cost is the same on both revisions.
+
+The branch's warm and stale deltas against `main` are real but are not a stage-count effect. On a stale build they are the per-key map-step machinery (`#keyId` content hashing, item 12; the delta fold, item 13; per-invocation allocation). On a warm build the project is served from cache and tasks are skipped, so the delta is startup and module loading, not the step pipeline; the plan-time module-loading part is item 18. Precise numbers live in the benchmark results repository alongside the config that produced them, not here, since they drift with the code.
+
+### 15. The step invocation sidecar is re-serialized only for stages that re-recorded
+
+The per-stage step invocation data (`task_metadata` type `"steps"`) was re-serialized and rewritten in `writeCache` on every build that writes cache, for every step-based stage, whether or not its map changed. `getStepInvocationData` loads and memoizes a stage's map (the `getPreviousInvocationData` hook calls it for every step, including full cache hits that never re-record), and the old `#prepareStageRequestCache` loop walked the whole memoized map and emitted a row for each non-empty entry. A full-hit stage therefore paid a `JSON.stringify` plus a SQLite write of its unchanged map for nothing.
+
+**Measured (2026-10, cold-built `sap.m` + its three built dependencies, scratch cache):** the sidecar is tens of KB per step stage, not the multi-megabyte an earlier estimate assumed, because the per-key id was shortened to `path` + `lastModified` + `size` (item 12). `SELECT project_id, count(*), sum(length(data)) FROM task_metadata WHERE type='steps' GROUP BY project_id`:
+
+| Project | step rows | sidecar bytes |
+|---|---|---|
+| `sap.ui.core` | 7 | ~239 KB |
+| `sap.m` | 6 | ~226 KB |
+| `sap.ui.layout` | 6 | ~29 KB |
+| `sap.ui.unified` | 6 | ~22 KB |
+
+Largest single row ~94 KB (`replaceVersion`), ~515 KB across the four projects per build.
+
+The fix tracks which stages re-recorded (a dirty `Set` added to by `setStepInvocationData`, the only mutation path; `getStepInvocationData` loads without marking) and emits only those. On a one-file delta build (`Button.js` edited), `sap.m` re-records 3 of its 7 loaded step stages; the other 4 (and every step stage of the three dependencies, all full hits on this delta) are no longer rewritten. `writeCache` for `sap.m` was ~150 ms on this scenario; the sidecar serialization it now skips is a small fraction of that, so the direct wall-clock win is minor in CLI mode where the write is deferred off the critical path. As with the request-graph dirty-flag fix (§13), it matters more in BuildServer mode (Phase 4), where cache writes are awaited and each skipped row shortens the awaited write.
+
+Alongside this, `#storeStepReturns` previously opened one SQLite transaction per returning invocation; it now buffers compressed rows and the driver flushes one transaction per step (`StepRunner.#runGroup` calls the store's `flush` after a step's invocations run). No shipped builder task returns resources from `each`, so this path is latent, but the first task that does would otherwise pay a transaction per key. The return descriptors are also built from the metadata `#prepareStageResources` already computed rather than re-reading each resource's `getIntegrity()`/`getSize()`.
+
+### 16. The stage prefetch never paid off and was removed
+
+A one-stage-ahead prefetch (`#prefetchNextStageCache`, `prefetchStageCache`, `#prefetchedStageReads`) read the next stage's cache rows while the current stage was prepared, on the premise that the read would overlap the current stage's execution. Every `CacheManager` read is synchronous better-sqlite3, so there is no overlap to win: the prefetch moves the same blocking read earlier in the same thread. It also computed the next stage's signatures before that stage's `updateProjectIndices` ran, so on a delta build the prefetched signatures did not match the ones the lookup then asked for, and it read every existing signature's `resourceMetadata` while `#findStageCache` needs only the first match.
+
+**Measured (2026-10, `sap.m` with its three built dependencies, working-tree CLI via `UI5_CLI_NO_LOCAL`):** counters around the prefetch over a whole build.
+
+| Scenario | signatures read | lookups served from prefetch | hit rate | bytes deserialized | stages that read disk anyway |
+|---|---|---|---|---|---|
+| Cold (empty cache) | 0 | 0 | n/a | 0 | 0 |
+| Warm (no change) | 0 | 0 | n/a | 0 | 0 |
+| One file changed (delta) | 8 | 3 | 37.5% | ~736 KB | 5 |
+
+Cold has nothing cached to prefetch. The warm no-change build is served by the project-level result cache before any per-stage `prepareStageExecutionAndValidateCache` runs, so the prefetch never fires. The delta path is the only one that prefetches, and 5 of its 8 prefetched maps missed the lookup (the stale-signature and over-read effects above). A hyperfine A/B (prefetch on vs a `UI5_NO_PREFETCH` early return, warmup 3 / runs 10) found no win: cold 21.91 s vs 21.88 s and warm 2.43 s vs 2.52 s are within noise, and on the delta path prefetch-off was marginally faster (4.654 s vs 4.753 s, 1.02x). The mechanism was removed; `#findStageCache` keeps the in-memory `StageCache` fast path and the single-row disk read.
+
+### 17. Per-stage hot-path micro-costs: one real cold-build win, the rest within noise
+
+A set of small inefficiencies in paths that now run once per stage was reviewed as a possible contributor to the branch building slower than `main`. Measured on `sap.m` (with its three built dependencies, working-tree CLI via `UI5_CLI_NO_LOCAL`, isolated `UI5_DATA_DIR`), only one moves wall-clock, and only on a cold build.
+
+Applied unconditionally, all behavior-preserving:
+- **`#writtenResultResourcePaths` accumulation.** Three sites appended to this ordered list behind an `Array.includes` membership test. The list grows to the project's full written-resource count and is appended to once per written resource per stage, so the membership scan is O(n squared) per stage. A parallel `Set` now backs the membership check; the ordered list stays for `updateProjectIndices`. This is largest on a **cold** build, where every one of `sap.m`'s ~12k written resources is checked against a growing array across every stage.
+- **Empty input and root signatures.** `TaskInputSet.#computeSignature` and `BuildStageCache.getRootSignature` each built a sha256 over an empty list on every call, producing a known constant. Both lists are empty for every stage of a standard build (no shipped task records inputs at the stage level or reads through `getRootReader`). Each now returns a module-level constant for the empty case, equal to the digest the loop produced (covered by unit tests).
+- **Input-set sort.** `TaskInputSet.getEntries()` sorted by `(type + "\0" + name).localeCompare(...)`, running ICU collation on ASCII identifiers on every `getInputSignature()` call. It now uses a plain code-point comparison on the composite `type\0name` key and memoizes the sorted array (the map is populated only in the constructor). A unit test asserts the code-point order equals the previous `localeCompare` order for the recorded input shapes, so no stage signature moves.
+
+Left as-is after analysis:
+- **`updateProjectIndices` input.** The list passed per stage is the paths accumulated so far this build (source changes plus earlier stages' writes), not the whole build's final set, and it grows as stages run, so stage N already receives only the changes from stages 0..N-1. A finer per-stage delta is not safely derivable: this stage's cached index baseline is the previous build's final state, so it must see every change since then. `updateIndices` also early-exits when the stage recorded no requests. Documented at the call site.
+- **Linear stage lookup.** The per-stage `#stageOrder.indexOf(stageId)` the review flagged lived in the one-stage-ahead prefetch, which was already removed (§16). No lookup remains.
+
+Skipped after measurement (no win in any scenario):
+- **Write-buffer flush.** `StepRunner.#flushWriteBuffer` drains a map step's buffered writes with a sequential `await` loop. The duplicate-path rejection is enforced at buffer insertion, not flush, so the flush is a pure replay of distinct-path writes to the in-memory stage workspace, and the buffer already holds every write before the flush, so parallelizing does not cut peak memory. Instrumented totals: on a **stale** one-file build no flush batch exceeds 50 writes (sub-millisecond); on a **cold** build the flush totals ~147 ms across the whole ~21 s build (largest single batch 2565 writes in ~40 ms, ~15 µs/write, consistent with memory-adapter writes). Parallelizing would save a fraction of that against a real write-ordering risk, so the sequential loop stays.
+- **Per-invocation `MonitoredTaskUtil` proxy.** The proxy allocates a wrapper closure per tracked-method access. Counting `get`-trap invocations across a whole build: ~4,973 on a stale one-file build, ~183,261 on a cold build (every invocation runs). At tens of nanoseconds per short-lived closure this is a few milliseconds on a ~21 s cold build and negligible on stale, so caching bound methods on the per-invocation proxy (against the deliberate per-invocation isolation) was not worth it.
+
+**Aggregate before/after (hyperfine, isolated `UI5_DATA_DIR`):**
+
+| Scenario | Before | After |
+|---|---|---|
+| Stale (one file appended to `Button.js`, warmup 2 / runs 8) | 4.630 s ± 0.067 | 4.723 s ± 0.086 |
+| Cold (empty cache, warmup 1 / runs 3) | 21.438 s ± 0.165 | 20.598 s ± 0.195 |
+
+Stale is within noise (the ranges overlap; these edits barely execute when few invocations run). Cold is ~0.8 s faster (~4%), consistent with the O(n squared) accumulation removal being largest where ~12k resources are written. The headline is correctness and hygiene, with a measurable cold-build improvement and no stale regression.
+
+### 18. Step-based task modules must not import their processors at plan time
+
+`TaskRunner.runTasks` imports every step-based task's module and calls its factory at plan time, before the cache decides whether any step runs, to discover step names for `setTasks`. When a task module imported its processor at module top level, planning evaluated that processor's whole graph for every step-based task, including tasks that turn out to be full cache hits and never run a step body. The heavy graphs are `buildThemes`' `less-openui5` (pulled in through `themeBuilderWorker.js` -> `themeBuilder.js`), `minify`'s `minifier`, `enhanceManifest`'s `manifestEnhancer` (`semver`), and `generateThemeDesignerResources`' less generator. On `main` these loaded lazily inside the task body, after the cache check; the step-factory refactor moved them to module top level because the factory module is imported eagerly for discovery.
+
+The fix keeps the factory cheap and defers each processor to its step body (`const p = (await import("../processors/...")).default`), so a cache-hit build never loads it. `buildThemes` is the exception: its worker module `themeBuilderWorker.js` is both the main-thread fs-bridge helper source and the workerpool worker entry, so dynamically importing it from the main thread breaks the worker tests (a dangling, unterminated pool). Instead `themeBuilderWorker.js` defers `themeBuilder` (the `less-openui5` graph) inside its worker entry `execThemeBuild`; its static `workerpool` import stays, since the worker registration runs at module load. `workerpool` is light (~4 ms).
+
+**Measured (2026-10, min-of-5 fresh-process import of the eight library step-based task modules, `node --input-type=module`):**
+
+| Task module set | Before | After |
+|---|---|---|
+| All eight imported in one process | ~58 ms | ~40 ms |
+| `buildThemes` alone (fresh process) | ~64 ms | ~37 ms |
+
+The aggregate drop is bounded by dependency sharing: the light factory modules still load `@ui5/fs` and `@ui5/logger`, and `buildThemes` still loads `workerpool`. The win is the heavy processor graphs (`less-openui5`, `minifier`, `semver`, the less generator) no longer evaluating at plan time, which also keeps them out of memory on a warm build where no step runs. This is the "module loading" part of the warm-build delta noted in item 14. Measure it directly (import the task modules and time module evaluation, or `NODE_OPTIONS=--cpu-prof` on a warm `sap.m` build and read module-eval time before the first `_executeTask`) rather than through the end-to-end build, where ~18 ms sits below the stale/warm noise floor.
+
+## Investigation Workflow
+
+1. **Establish a baseline.** Run the build 2-3 times to get stable warm-cache timings. Note the total time and per-phase breakdown.
+
+2. **Identify the scenario.** Are you investigating warm cache (no changes), stale cache (file edit), or cold cache (no cache at all)?
+
+3. **Find the dominant phase.** In the perf log, look for the largest times:
+   - Source index init? → Check `fromCacheWithDelta` vs total to see if it's I/O or hash-bound
+   - Dependency index flush? → Check "changed paths" count and "cache misses"
+   - Task execution? → Check which tasks run and whether they run as a delta (◇, a step-based task with a re-run step or a legacy delta) or a full re-execution (›)
+   - `allTasksCompleted`? → Check `#revalidateSourceIndex` and `#freezeUntransformedSources` sub-timings
+   - Cache write? → Check the sub-operation breakdown
+
+4. **Drill down.** For the dominant phase:
+   - Add more granular `log.perf()` statements if needed
+   - Use `console.time()`/`console.timeEnd()` for quick local profiling
+   - Check `isUnchangedCalls` vs `isUnchangedHits` to understand if resources are being unnecessarily re-hashed
+
+5. **Validate optimization ideas.** When proposing optimizations:
+   - Consider warm vs stale vs cold cache impact separately
+   - Check if the optimization target already has an early-exit path (e.g., `ResourceRequestManager.updateIndices` exits early when `requestGraph.getSize() === 0`)
+   - Measure with the test build before and after
+
+6. **Watch for measurement artifacts.** The first run after a system boot or after a long idle period will be slower due to OS filesystem cache being cold. Run 2-3 times to get stable readings.

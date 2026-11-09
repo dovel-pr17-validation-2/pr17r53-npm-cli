@@ -1,0 +1,59 @@
+import process from "node:process";
+import {setLogLevel, isLogLevelEnabled, getLogger, getLogLevel} from "@ui5/logger";
+import ConsoleWriter from "@ui5/logger/writers/Console";
+import {getVersion, getVersionWithLocation} from "../version.js";
+
+// Log levels at which the interactive banner is counterproductive, so we fall
+// back to the plain Console writer:
+//   - silent: the user asked for minimal or no output, so we honor that intent
+//   - silly: high-volume tracing where a pinned status region hinders debugging
+const NON_INTERACTIVE_LEVELS = new Set(["silly", "silent"]);
+
+/**
+ * Logger middleware to enable logging capabilities
+ *
+ * @param {object} argv logger arguments
+ */
+export async function initLogger(argv) {
+	if (argv.silent) {
+		setLogLevel("silent");
+	}
+	if (argv.perf) {
+		setLogLevel("perf");
+	}
+	if (argv.verbose) {
+		setLogLevel("verbose");
+	}
+	if (argv.loglevel && argv.loglevel !== "info") {
+		// argv.loglevel defaults to "info", which is anyways already the Logger's default
+		// Therefore do not explicitly set it again in order to allow overwriting the log level
+		// using the UI5_LOG_LVL environment variable
+		setLogLevel(argv.loglevel);
+	}
+
+	const commandName = Array.isArray(argv._) ? argv._[0] : null;
+	const useInteractive =
+		commandName === "serve" &&
+		process.stderr.isTTY === true &&
+		!NON_INTERACTIVE_LEVELS.has(getLogLevel()) &&
+		!process.env.UI5_CLI_NO_INTERACTIVE;
+
+	if (useInteractive) {
+		const {default: InteractiveConsole} = await import("@ui5/logger/writers/InteractiveConsole");
+		InteractiveConsole.init();
+		// Populate the interactive writer's header region before any command
+		// work starts, so the tool identity is visible from the first frame.
+		process.emit("ui5.tool-info", {
+			name: "UI5 CLI",
+			version: getVersion() || "",
+		});
+	} else {
+		ConsoleWriter.init();
+	}
+
+	if (isLogLevelEnabled("verbose")) {
+		const log = getLogger("cli:middlewares:base");
+		log.verbose(`using @ui5/cli version ${getVersionWithLocation()}`);
+		log.verbose(`using node version ${process.version}`);
+	}
+}

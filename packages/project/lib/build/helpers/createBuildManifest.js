@@ -1,0 +1,96 @@
+import {createRequire} from "node:module";
+
+// Using CommonsJS require since JSON module imports are still experimental
+const require = createRequire(import.meta.url);
+
+export async function getPackageVersion(pkg) {
+	return require(`${pkg}/package.json`).version;
+}
+
+function getSortedTags(project) {
+	const tags = project.getProjectResourceTagCollection().getAllTags();
+	const entities = Object.entries(tags);
+	entities.sort(([keyA], [keyB]) => {
+		return keyA.localeCompare(keyB);
+	});
+	return Object.fromEntries(entities);
+}
+
+export default async function(project, buildConfig, taskRepository, signature) {
+	if (!project) {
+		throw new Error(`Missing parameter 'project'`);
+	}
+	if (!buildConfig) {
+		throw new Error(`Missing parameter 'buildConfig'`);
+	}
+	if (!taskRepository) {
+		throw new Error(`Missing parameter 'taskRepository'`);
+	}
+	if (!signature) {
+		throw new Error(`Missing parameter 'signature'`);
+	}
+
+	const projectName = project.getName();
+	const type = project.getType();
+
+	const pathMapping = Object.create(null);
+	switch (type) {
+	case "application":
+		pathMapping.webapp = `resources/${project.getNamespace()}`;
+		break;
+	case "library":
+	case "theme-library":
+		pathMapping.src = `resources`;
+		pathMapping.test = `test-resources`;
+		break;
+	default:
+		throw new Error(
+			`Unable to create archive metadata for project ${project.getName()}: ` +
+			`Project type ${type} is currently not supported`);
+	}
+
+	const metadata = {
+		project: {
+			specVersion: project.getSpecVersion().toString(),
+			type,
+			metadata: {
+				name: projectName,
+			},
+			resources: {
+				configuration: {
+					paths: pathMapping
+				}
+			}
+		},
+		buildManifest: await createBuildManifest(project, buildConfig, taskRepository, signature),
+	};
+
+	return metadata;
+}
+
+async function createBuildManifest(project, buildConfig, taskRepository, signature) {
+	// Use legacy manifest version for framework libraries to ensure compatibility
+	const {builderVersion, fsVersion: builderFsVersion} = await taskRepository.getVersions();
+	const buildManifest = {
+		manifestVersion: "1.0",
+		timestamp: new Date().toISOString(),
+		signature,
+		versions: {
+			builderVersion: builderVersion,
+			projectVersion: await getPackageVersion("@ui5/project"),
+			fsVersion: await getPackageVersion("@ui5/fs"),
+		},
+		buildConfig,
+		version: project.getVersion(),
+		namespace: project.getNamespace(),
+		tags: getSortedTags(project)
+	};
+
+	if (buildManifest.versions.fsVersion !== builderFsVersion) {
+		// Added in manifestVersion 0.2:
+		// @ui5/project and @ui5/builder use different versions of @ui5/fs.
+		// This should be mentioned in the build manifest:
+		buildManifest.versions.builderFsVersion = builderFsVersion;
+	}
+	return buildManifest;
+}

@@ -1,0 +1,875 @@
+import {rmrf} from "../utils/fs.js";
+import * as resourceFactory from "@ui5/fs/resourceFactory";
+import BuildLogger from "@ui5/logger/internal/loggers/Build";
+import composeProjectList from "./helpers/composeProjectList.js";
+import BuildContext from "./helpers/BuildContext.js";
+import prettyHrtime from "pretty-hrtime";
+import OutputStyleEnum from "./helpers/ProjectBuilderOutputStyle.js";
+import {isAbortError} from "./helpers/abort.js";
+
+/**
+ * @public
+ * @class
+ * @alias @ui5/project/build/ProjectBuilder
+ */
+class ProjectBuilder {
+	#log;
+	#buildIsRunning = false;
+
+	/**
+	 * Build Configuration
+	 *
+	 * @public
+	 * @typedef {object} @ui5/project/build/ProjectBuilder~BuildConfiguration
+	 * @property {boolean} [selfContained=false] Flag to activate self contained build
+	 * @property {boolean} [jsdoc=false] Flag to activate JSDoc build
+	 * @property {boolean} [createBuildManifest=false]
+	 *   Whether to create a build manifest file for the root project.
+	 *   This is currently only supported for projects of type 'library' and 'theme-library'
+	 *   No other dependencies can be included in the build result.
+	 * @property {module:@ui5/project/build/ProjectBuilderOutputStyle} [outputStyle=Default]
+	 *   Processes build results into a specific directory structure.
+	 * @property {Array.<string>} [includedTasks=[]] List of tasks to be included
+	 * @property {Array.<string>} [excludedTasks=[]] List of tasks to be excluded.
+	 * 			If the wildcard '*' is provided, only the included tasks will be executed.
+	 * @property {module:@ui5/project/build/cache/Cache} [cache=Cache.Default]
+	 * Cache mode to use for building UI5 projects
+	 */
+
+	/**
+	 * As an alternative to providing plain lists of names of dependencies to include and exclude, you can provide a
+	 * more complex "Dependency Includes" object to define which dependencies should be part of the build result.
+	 * <br>
+	 * This information is then used to compile lists of <code>includedDependencies</code> and
+	 * <code>excludedDependencies</code>, which are applied during the build process.
+	 * <br><br>
+	 * Regular expression-parameters are directly applied to a list of all project dependencies
+	 * so that they don't need to be evaluated in later processing steps.
+	 * <br><br>
+	 * Generally, includes are handled with a higher priority than excludes. Additionally, operations for processing
+	 * transitive dependencies are handled with a lower priority than explicitly mentioned dependencies. The "default"
+	 * dependency-includes are appended at the end.
+	 * <br><br>
+	 * The priority of the various dependency lists is applied in the following order.
+	 * Note that a later exclude can't overrule an earlier include.
+	 * <br>
+	 * <ol>
+	 *   <li><code>includeDependency</code>, <code>includeDependencyRegExp</code></li>
+	 *   <li><code>excludeDependency</code>, <code>excludeDependencyRegExp</code></li>
+	 *   <li><code>includeDependencyTree</code></li>
+	 *   <li><code>excludeDependencyTree</code></li>
+	 *   <li><code>defaultIncludeDependency</code>, <code>defaultIncludeDependencyRegExp</code>,
+	 *     <code>defaultIncludeDependencyTree</code></li>
+	 * </ol>
+	 *
+	 * @public
+	 * @typedef {object} @ui5/project/build/ProjectBuilder~DependencyIncludes
+	 * @property {boolean} includeAllDependencies
+	 *   Whether all dependencies should be part of the build result
+	 *	 This parameter has the lowest priority and basically includes all remaining (not excluded) projects as include
+	 * @property {string[]} includeDependency
+	 *   The dependencies to be considered in <code>includedDependencies</code>; the
+	 *   <code>*</code> character can be used as wildcard for all dependencies and
+	 *   is an alias for the CLI option <code>--all</code>
+	 * @property {string[]} includeDependencyRegExp
+	 *   Strings which are interpreted as regular expressions
+	 *   to describe the selection of dependencies to be considered in <code>includedDependencies</code>
+	 * @property {string[]} includeDependencyTree
+	 *   The dependencies to be considered in <code>includedDependencies</code>;
+	 *   transitive dependencies are also appended
+	 * @property {string[]} excludeDependency
+	 *   The dependencies to be considered in <code>excludedDependencies</code>
+	 * @property {string[]} excludeDependencyRegExp
+	 *   Strings which are interpreted as regular expressions
+	 *   to describe the selection of dependencies to be considered in <code>excludedDependencies</code>
+	 * @property {string[]} excludeDependencyTree
+	 *   The dependencies to be considered in <code>excludedDependencies</code>;
+	 *   transitive dependencies are also appended
+	 * @property {string[]} defaultIncludeDependency
+	 *   Same as <code>includeDependency</code> parameter;
+	 *   typically used in project build settings
+	 * @property {string[]} defaultIncludeDependencyRegExp
+	 *   Same as <code>includeDependencyRegExp</code> parameter;
+	 *   typically used in project build settings
+	 * @property {string[]} defaultIncludeDependencyTree
+	 *   Same as <code>includeDependencyTree</code> parameter;
+	 *   typically used in project build settings
+	 */
+
+	/**
+	 * Executes a project build, including all necessary or requested dependencies
+	 *
+	 * @public
+	 * @param {object} parameters
+	 * @param {@ui5/project/graph/ProjectGraph} parameters.graph Project graph
+	 * @param {@ui5/project/build/ProjectBuilder~BuildConfiguration} [parameters.buildConfig] Build configuration
+	 * @param {@ui5/builder/tasks/taskRepository} parameters.taskRepository Task Repository module to use
+	 * @param {string} [parameters.ui5DataDir]
+	 *   Explicit UI5 data directory to use for the build cache, overriding the
+	 *   <code>UI5_DATA_DIR</code> environment variable, the UI5 configuration file,
+	 *   and the default of <code>~/.ui5</code>.
+	 */
+	constructor({graph, buildConfig, taskRepository, ui5DataDir}) {
+		if (!graph) {
+			throw new Error(`Missing parameter 'graph'`);
+		}
+		if (!taskRepository) {
+			throw new Error(`Missing parameter 'taskRepository'`);
+		}
+		if (!graph.isSealed()) {
+			throw new Error(
+				`Can not build project graph with root node ${graph.getRoot().getName()}: Graph is not sealed`);
+		}
+
+		this._graph = graph;
+		this._buildContext = new BuildContext(graph, taskRepository, buildConfig, {ui5DataDir});
+		this.#log = new BuildLogger("ProjectBuilder");
+	}
+
+	/**
+	 * Propagate resource changes through the build context
+	 *
+	 * @public
+	 * @param {Array} changes Array of resource changes to propagate
+	 * @returns {Set<string>} Names of projects potentially affected by the resource changes
+	 * @throws {Error} If a build is currently running
+	 */
+	resourcesChanged(changes) {
+		if (this.#buildIsRunning) {
+			throw new Error(`Unable to safely propagate resource changes. Build is currently running.`);
+		}
+		return this._buildContext.propagateResourceChanges(changes);
+	}
+
+	/**
+	 * Discards all in-memory build caches so that the next build of each project re-scans its
+	 * source tree from scratch and diffs it against the persisted index.
+	 *
+	 * For long-running consumers (such as the [BuildServer]{@link @ui5/project/build/BuildServer})
+	 * to recover when the incremental change signal became unreliable, most notably when the OS
+	 * file watcher reports dropped events and the file system must be re-scanned. After this call
+	 * the next build treats every source file as a change candidate, re-validating cached results
+	 * that a missed event would otherwise have kept stale.
+	 *
+	 * @public
+	 * @throws {Error} If a build is currently running
+	 */
+	forceFullRescan() {
+		if (this.#buildIsRunning) {
+			throw new Error(`Unable to safely force a full re-scan. Build is currently running.`);
+		}
+		this._buildContext.discardIncrementalState();
+	}
+
+	/**
+	 * Releases the build cache database connection and any underlying storage resources.
+	 *
+	 * Must be called by consumers of {@link #build} once they are done with this builder
+	 * (e.g. when shutting down a long-running [BuildServer]{@link @ui5/project/build/BuildServer}).
+	 * {@link #buildToTarget} closes the CacheManager automatically and does not require this call.
+	 *
+	 * Safe to call multiple times; subsequent calls are no-ops. After this method returns,
+	 * the builder must not be used for further builds.
+	 *
+	 * @public
+	 */
+	closeCacheManager() {
+		this._buildContext.closeCacheManager();
+	}
+
+	/**
+	 * Build projects without writing to a target directory.
+	 *
+	 * Intended for long-running consumers (such as the
+	 * [BuildServer]{@link @ui5/project/build/BuildServer}) that access build results through
+	 * readers rather than the file system. Multiple sequential calls are supported and reuse
+	 * the same build cache.
+	 *
+	 * The caller is responsible for releasing the underlying build cache database by invoking
+	 * {@link #closeCacheManager} once the builder is no longer needed. Failing to do so leaks
+	 * the SQLite connection and its memory mapping, which on Windows also blocks deletion of
+	 * the cache directory by subsequent processes.
+	 *
+	 * @public
+	 * @param {object} parameters Parameters
+	 * @param {boolean} [parameters.includeRootProject=true] Whether to include the root project
+	 * @param {Array.<string|RegExp>} [parameters.includedDependencies=[]] List of dependencies to include
+	 * @param {Array.<string|RegExp>} [parameters.excludedDependencies=[]] List of dependencies to exclude
+	 * @param {AbortSignal} [parameters.signal] Signal to abort the build
+	 * @param {Function} [projectBuiltCallback] Callback invoked after each project is built
+	 * @returns {Promise<string[]>} Promise resolving with array of processed project names
+	 */
+	async build({
+		includeRootProject = true,
+		includedDependencies = [], excludedDependencies = [],
+		signal,
+	}, projectBuiltCallback) {
+		const requestedProjects = this._determineRequestedProjects(
+			includeRootProject, includedDependencies, excludedDependencies);
+		return await this.#build(requestedProjects, projectBuiltCallback, signal);
+	}
+
+	/**
+	 * Validate the build cache for a set of projects without actually building any of them.
+	 *
+	 * Intended to be used by long-running consumers (such as the
+	 * [BuildServer]{@link @ui5/project/build/BuildServer}) to proactively determine whether
+	 * a cached build result can be reused for a project. Walks the dependency graph in the
+	 * same order as {@link #build}, so dependencies are validated before their dependents
+	 * and resource changes propagate correctly.
+	 *
+	 * For each requested project, the given callback is invoked with the validation result
+	 * once that project has been validated. The result indicates whether a cached build
+	 * result is available and can be used (<code>true</code>) or whether a build would be
+	 * required (<code>false</code>).
+	 *
+	 * Like {@link #build}, this method is mutually exclusive with itself and with other
+	 * build operations on the same builder instance. Source change propagation via
+	 * {@link #resourcesChanged} is blocked while validation is running.
+	 *
+	 * @public
+	 * @param {object} parameters Parameters
+	 * @param {string[]} parameters.projects Names of projects to validate
+	 * @param {AbortSignal} [parameters.signal] Signal to abort the validation
+	 * @param {Function} [parameters.willValidate]
+	 *   Hook invoked synchronously just before each project's <code>validateCache</code>
+	 *   call. Receives <code>(projectName)</code>. Return value is ignored. Use this to
+	 *   claim the project state in the caller (e.g. transition to a "validating"
+	 *   lifecycle state).
+	 * @param {Function} [projectValidatedCallback]
+	 *   Callback invoked after each requested project has been validated.
+	 *   Receives <code>(projectName, project, projectBuildContext, usesCache)</code>.
+	 * @returns {Promise<string[]>} Promise resolving with the names of all processed projects
+	 */
+	async validateCaches({projects, signal, willValidate}, projectValidatedCallback) {
+		return await this.#validate(projects, willValidate, projectValidatedCallback, signal);
+	}
+
+	/**
+	 * Executes a project build, including all necessary or requested dependencies, and writes
+	 * the result to the given target directory.
+	 *
+	 * Closes the build cache database before returning, so {@link #closeCacheManager} does not
+	 * need to be called by the consumer. After this method returns, the builder must not be
+	 * used for further builds. For repeated builds against the same builder instance — e.g.
+	 * in a long-running [BuildServer]{@link @ui5/project/build/BuildServer} — use
+	 * {@link #build} instead and close the CacheManager explicitly when done.
+	 *
+	 * @public
+	 * @param {object} parameters Parameters
+	 * @param {string} parameters.destPath Target path
+	 * @param {boolean} [parameters.cleanDest=false] Decides whether project should clean the target path before build
+	 * @param {Array.<string|RegExp>} [parameters.includedDependencies=[]]
+	 *   List of names of projects to include in the build result
+	 *   If the wildcard '*' is provided, all dependencies will be included in the build result.
+	 * @param {Array.<string|RegExp>} [parameters.excludedDependencies=[]]
+	 *   List of names of projects to exclude from the build result.
+	 * @param {@ui5/project/build/ProjectBuilder~DependencyIncludes} [parameters.dependencyIncludes]
+	 *   Alternative to the <code>includedDependencies</code> and <code>excludedDependencies</code> parameters.
+	 *   Allows for a more sophisticated configuration for defining which dependencies should be
+	 *   part of the build result. If this is provided, the other mentioned parameters are ignored.
+	 * @returns {Promise} Promise resolving once the build has finished
+	 */
+	async buildToTarget({
+		destPath, cleanDest = false,
+		includedDependencies = [], excludedDependencies = [],
+		dependencyIncludes,
+	}) {
+		if (!destPath) {
+			throw new Error(`Missing parameter 'destPath'`);
+		}
+
+		if (dependencyIncludes) {
+			if (includedDependencies.length || excludedDependencies.length) {
+				throw new Error(
+					"Parameter 'dependencyIncludes' can't be used in conjunction " +
+					"with parameters 'includedDependencies' or 'excludedDependencies");
+			}
+		}
+		this.#log.info(`Target directory: ${destPath}`);
+		const requestedProjects = this._determineRequestedProjects(
+			true, includedDependencies, excludedDependencies, dependencyIncludes);
+
+		if (cleanDest) {
+			this.#log.info(`Cleaning target directory...`);
+			await rmrf(destPath);
+		}
+
+		let fsTarget;
+		if (!process.env.UI5_BUILD_NO_WRITE_DEST) {
+			fsTarget = resourceFactory.createAdapter({
+				fsBasePath: destPath,
+				virBasePath: "/"
+			});
+		}
+		const pWrites = [];
+		try {
+			await this.#build(requestedProjects, async (projectName, project, projectBuildContext) => {
+				if (!fsTarget) {
+					// Nothing to write to
+					return;
+				}
+				// Only write requested projects to target
+				// (excluding dependencies that were required to be built, but not requested)
+				this.#log.verbose(`Writing out files for project ${projectName}...`);
+				await this._writeResults(projectBuildContext, fsTarget, pWrites);
+			});
+			await Promise.all(pWrites);
+		} finally {
+			this._buildContext.closeCacheManager();
+		}
+	}
+
+	/**
+	 * Determine which projects should be built based on filter criteria
+	 *
+	 * @param {boolean} includeRootProject Whether to include the root project
+	 * @param {Array.<string|RegExp>} includedDependencies Dependencies to include
+	 * @param {Array.<string|RegExp>} excludedDependencies Dependencies to exclude
+	 * @param {@ui5/project/build/ProjectBuilder~DependencyIncludes} [dependencyIncludes]
+	 *   Alternative dependency configuration
+	 * @returns {string[]} Array of project names to build
+	 * @throws {Error} If creating a build manifest with multiple projects
+	 */
+	_determineRequestedProjects(includeRootProject, includedDependencies, excludedDependencies, dependencyIncludes) {
+		// Get project filter function based on include/exclude params
+		// (also logs some info to console)
+		const filterProject = this._createProjectFilter({
+			includeRootProject,
+			explicitIncludes: includedDependencies,
+			explicitExcludes: excludedDependencies,
+			dependencyIncludes
+		});
+
+		// Count total number of projects to build based on input
+		const requestedProjects = this._graph.getProjectNames().filter(function(projectName) {
+			return filterProject(projectName);
+		});
+
+		if (requestedProjects.length > 1) {
+			const {createBuildManifest} = this._buildContext.getBuildConfig();
+			if (createBuildManifest) {
+				throw new Error(
+					`It is currently not supported to request the creation of a build manifest ` +
+					`while including any dependencies into the build result`);
+			}
+		}
+
+		return requestedProjects;
+	}
+
+	/**
+	 * Resolves the project build contexts for the requested projects (plus their transitive
+	 * build-time dependencies) and returns them in dependency-first (DFS) order. Shared setup
+	 * for {@link #build} and {@link #validate}; the DFS ordering ensures that dependencies are
+	 * processed before their dependents, so propagated resource changes reach dependents in
+	 * time.
+	 *
+	 * @param {string[]} requestedProjects Names of the projects the caller wants to process
+	 * @returns {Promise<{
+	 *   projectBuildContexts: Map<string, @ui5/project/build/helpers/ProjectBuildContext>,
+	 *   queue: @ui5/project/build/helpers/ProjectBuildContext[],
+	 *   processedProjectNames: string[]
+	 * }>}
+	 *   The full context map, plus a DFS-ordered array of the contexts that will be walked
+	 *   and the matching project names in the same order.
+	 */
+	async #buildProjectQueue(requestedProjects) {
+		const reqStart = performance.now();
+		const projectBuildContexts = await this._buildContext.getRequiredProjectContexts(requestedProjects);
+		if (this.#log.isLevelEnabled("perf")) {
+			this.#log.perf(
+				`getRequiredProjectContexts completed in ${(performance.now() - reqStart).toFixed(2)} ms`);
+		}
+
+		const queue = [];
+		const processedProjectNames = [];
+		for (const {project} of this._graph.traverseDependenciesDepthFirst(true)) {
+			const projectName = project.getName();
+			const projectBuildContext = projectBuildContexts.get(projectName);
+			if (projectBuildContext) {
+				// Build context exists
+				//	=> This project needs to be built or, in case it has already
+				//		been built, it's build result needs to be written out (if requested)
+				queue.push(projectBuildContext);
+				processedProjectNames.push(projectName);
+			}
+		}
+		return {projectBuildContexts, queue, processedProjectNames};
+	}
+
+	/**
+	 * Internal build implementation that orchestrates the actual build process
+	 *
+	 * @param {string[]} requestedProjects Array of project names to build
+	 * @param {Function} [projectBuiltCallback] Callback invoked after each project is built
+	 * @param {AbortSignal} [signal] Signal to abort the build
+	 * @returns {Promise<string[]>} Promise resolving with array of processed project names
+	 * @throws {Error} If a build is already running
+	 */
+	async #build(requestedProjects, projectBuiltCallback, signal) {
+		if (this.#buildIsRunning) {
+			throw new Error("A build is already running");
+		}
+		this.#buildIsRunning = true;
+		// Fix a single timestamp for this run's time quantization (see BuildContext#refreshBuildTime)
+		this._buildContext.refreshBuildTime();
+		let cleanupSigHooks;
+		const pCacheWrites = [];
+		try {
+			cleanupSigHooks = this._registerCleanupSigHooks();
+			this.#log.info(`Preparing build for projects: ${requestedProjects.join(", ")}`);
+			const {queue, processedProjectNames} = await this.#buildProjectQueue(requestedProjects);
+
+			this.#log.setProjects(queue.map((projectBuildContext) => {
+				return projectBuildContext.getProject().getName();
+			}));
+
+			const alreadyBuilt = [];
+			for (const projectBuildContext of queue) {
+				if (!projectBuildContext.possiblyRequiresBuild()) {
+					const projectName = projectBuildContext.getProject().getName();
+					alreadyBuilt.push(projectName);
+				}
+			}
+
+			const startTime = process.hrtime();
+			// Tracks the project currently being processed so a genuine (non-abort) failure
+			// can discard its in-memory build state (see the catch below). Cleared once the
+			// loop completes without throwing.
+			let currentProjectContext = null;
+			try {
+				for (const projectBuildContext of queue) {
+					signal?.throwIfAborted();
+					currentProjectContext = projectBuildContext;
+					const project = projectBuildContext.getProject();
+					const projectName = project.getName();
+					const projectType = project.getType();
+					this.#log.verbose(`Processing project ${projectName}...`);
+
+					// Only build projects that are not already build (i.e. provide a matching build manifest)
+					if (alreadyBuilt.includes(projectName)) {
+						this.#log.skipProjectBuild(projectName, projectType);
+					} else {
+						const prepStart = performance.now();
+						const usesCache = await projectBuildContext.validateCache({prepareForBuild: true});
+						if (this.#log.isLevelEnabled("perf")) {
+							this.#log.perf(
+								`validateCache for ${projectName} ` +
+								`completed in ${(performance.now() - prepStart).toFixed(2)} ms ` +
+								`(usesCache=${usesCache})`);
+						}
+						signal?.throwIfAborted();
+						if (usesCache) {
+							this.#log.skipProjectBuild(projectName, projectType);
+							alreadyBuilt.push(projectName);
+						} else {
+							await this._buildProject(projectBuildContext, signal);
+						}
+					}
+					signal?.throwIfAborted();
+
+					if (projectBuiltCallback && requestedProjects.includes(projectName)) {
+						await projectBuiltCallback(projectName, project, projectBuildContext);
+					}
+
+					if (!alreadyBuilt.includes(projectName) && !process.env.UI5_BUILD_NO_WRITE_CACHE) {
+						this.#log.verbose(`Triggering cache update for project ${projectName}...`);
+						pCacheWrites.push(projectBuildContext.writeBuildCache());
+					}
+
+					projectBuildContext.buildFinished();
+				}
+				currentProjectContext = null;
+				this.#log.info(`Build succeeded in ${this._getElapsedTime(startTime)}`);
+			} catch (err) {
+				// A cooperative abort (e.g. caller aborted the signal, or the
+				// build cache invalidated mid-run via SourceChangedDuringBuildError)
+				// is not a build failure. The BuildServer turns it into a re-queue.
+				// Log at verbose so we don't shout an error at the user for what
+				// is a normal mid-build source change in `ui5 serve`.
+				if (isAbortError(err, signal)) {
+					this.#log.verbose(`Build aborted: ${err?.message ?? err}`);
+				} else {
+					this.#log.error(`Build failed`);
+					// A task threw mid-build, so allTasksCompleted never ran: the project's stage
+					// pipeline still holds the failing task's partial output, and its result
+					// signature is the previous successful build's. Discard that in-memory state so
+					// a later rebuild (after the source is fixed) re-imports clean stages from the
+					// persistent cache instead of serving the partial output.
+					// SourceChangedDuringBuildError already self-resets and is filtered out above by
+					// isAbortError.
+					currentProjectContext?.discardIncrementalState();
+				}
+				throw err;
+			}
+			return processedProjectNames;
+		} finally {
+			await Promise.all(pCacheWrites);
+			if (cleanupSigHooks) {
+				this._deregisterCleanupSigHooks(cleanupSigHooks);
+			}
+			await this._executeCleanupTasks();
+			this.#buildIsRunning = false;
+		}
+	}
+
+	/**
+	 * Internal validation implementation that mirrors {@link #build} but only validates caches.
+	 *
+	 * Loads the project build contexts, walks them in dependency-first order, and asks each
+	 * context to validate its build cache. The given callback is invoked after each requested
+	 * project has been validated with a flag indicating whether the cached build result is
+	 * usable.
+	 *
+	 * @param {string[]} requestedProjects Array of project names to validate
+	 * @param {Function} [willValidate] Hook invoked just before each project's validateCache call
+	 * @param {Function} [projectValidatedCallback]
+	 *   Callback invoked after each requested project has been validated
+	 * @param {AbortSignal} [signal] Signal to abort the validation
+	 * @returns {Promise<string[]>} Promise resolving with array of processed project names
+	 * @throws {Error} If a build is already running
+	 */
+	async #validate(requestedProjects, willValidate, projectValidatedCallback, signal) {
+		if (this.#buildIsRunning) {
+			throw new Error("A build is already running");
+		}
+		this.#buildIsRunning = true;
+		// Fix a single timestamp for this run's time quantization (see BuildContext#refreshBuildTime)
+		this._buildContext.refreshBuildTime();
+		try {
+			// Initialize (or reuse) the build contexts for the requested projects and their
+			// transitive build-time dependencies, mirroring what #build does. Validation is
+			// commonly invoked before any project has been built in this process — e.g. when
+			// `ui5 serve` runs a post-(initial-)build cache-validation pass over dependencies
+			// the initial build skipped — so it must be able to initialize cold contexts and
+			// source indices itself rather than only validating ones a prior build warmed up.
+			//
+			// This is race-free with `#revalidateSourceIndex`: the BuildServer's file watcher
+			// is up before any builds run, so file changes between this FS scan and a later
+			// build flow through `projectSourcesChanged` → `#flushPendingChanges` →
+			// `#updateSourceIndex` at the next build's start, leaving the source index
+			// consistent by the time `#revalidateSourceIndex` runs at build end.
+			const {projectBuildContexts, queue, processedProjectNames} =
+				await this.#buildProjectQueue(requestedProjects);
+			if (queue.length === 0) {
+				this.#log.verbose(`No projects to validate`);
+				return [];
+			}
+			this.#log.verbose(`Validating caches for projects: ${Array.from(projectBuildContexts.keys()).join(", ")}`);
+
+			// requestedProjects gates the willValidate + projectValidatedCallback hooks.
+			// The queue walks the full transitive closure (cold contexts included), so
+			// checking membership per project is O(N) on an array — hoist to a Set.
+			const requestedSet = new Set(requestedProjects);
+
+			try {
+				for (const projectBuildContext of queue) {
+					signal?.throwIfAborted();
+					const project = projectBuildContext.getProject();
+					const projectName = project.getName();
+					const isRequested = requestedSet.has(projectName);
+
+					if (willValidate && isRequested) {
+						willValidate(projectName);
+					}
+
+					let usesCache;
+					if (!projectBuildContext.possiblyRequiresBuild()) {
+						// Build manifest present (or cache already known fresh) -> no validation needed
+						usesCache = true;
+					} else {
+						const valStart = performance.now();
+						usesCache = await projectBuildContext.validateCache();
+						if (this.#log.isLevelEnabled("perf")) {
+							this.#log.perf(
+								`validateCache for ${projectName} ` +
+								`completed in ${(performance.now() - valStart).toFixed(2)} ms ` +
+								`(usesCache=${usesCache})`);
+						}
+					}
+
+					signal?.throwIfAborted();
+
+					if (projectValidatedCallback && isRequested) {
+						await projectValidatedCallback(projectName, project, projectBuildContext, usesCache);
+					}
+				}
+			} catch (err) {
+				if (isAbortError(err, signal)) {
+					this.#log.verbose(`Cache validation aborted: ${err?.message ?? err}`);
+				} else {
+					this.#log.error(`Cache validation failed: ${err?.message ?? err}`);
+				}
+				throw err;
+			}
+			return processedProjectNames;
+		} finally {
+			this.#buildIsRunning = false;
+		}
+	}
+
+	/**
+	 * Build a single project
+	 *
+	 * @param {object} projectBuildContext Build context for the project
+	 * @param {AbortSignal} [signal] Signal to abort the build
+	 * @returns {Promise<Array>} Promise resolving with array of changed resources
+	 */
+	async _buildProject(projectBuildContext, signal) {
+		const project = projectBuildContext.getProject();
+		const projectName = project.getName();
+		const projectType = project.getType();
+
+		this.#log.startProjectBuild(projectName, projectType);
+		const changedResources = await projectBuildContext.buildProject(signal);
+		this.#log.endProjectBuild(projectName, projectType);
+
+		return changedResources;
+	}
+
+	/**
+	 * Create a filter function to determine which projects should be built
+	 *
+	 * @param {object} parameters Parameters
+	 * @param {boolean} [parameters.includeRootProject=true] Whether to include the root project
+	 * @param {@ui5/project/build/ProjectBuilder~DependencyIncludes} [parameters.dependencyIncludes]
+	 *   Dependency configuration
+	 * @param {Array.<string|RegExp>} [parameters.explicitIncludes] Explicit dependencies to include
+	 * @param {Array.<string|RegExp>} [parameters.explicitExcludes] Explicit dependencies to exclude
+	 * @returns {Function} Filter function that takes a project name and returns boolean
+	 */
+	_createProjectFilter({
+		includeRootProject = true,
+		dependencyIncludes,
+		explicitIncludes,
+		explicitExcludes
+	}) {
+		const {includedDependencies, excludedDependencies} = composeProjectList(
+			this._graph,
+			dependencyIncludes || {
+				includeDependencyTree: explicitIncludes,
+				excludeDependencyTree: explicitExcludes
+			}
+		);
+
+		if (includedDependencies.length) {
+			if (includedDependencies.length === this._graph.getSize() - 1) {
+				this.#log.info(`  Requested all dependencies`);
+			} else {
+				this.#log.info(`  Requested dependencies:\n    + ${includedDependencies.join("\n    + ")}`);
+			}
+		}
+		if (excludedDependencies.length) {
+			this.#log.info(`  Excluded dependencies:\n    - ${excludedDependencies.join("\n    + ")}`);
+		}
+
+		const rootProjectName = this._graph.getRoot().getName();
+		return function projectFilter(projectName) {
+			function projectMatchesAny(deps) {
+				return deps.some((dep) => dep instanceof RegExp ?
+					dep.test(projectName) : dep === projectName);
+			}
+
+			if (includeRootProject && projectName === rootProjectName) {
+				// Include root project
+				return true;
+			}
+
+			if (projectMatchesAny(excludedDependencies)) {
+				return false;
+			}
+
+			if (includedDependencies.includes("*") || projectMatchesAny(includedDependencies)) {
+				return true;
+			}
+
+			return false;
+		};
+	}
+
+	/**
+	 * Write build results for a project to the target destination
+	 *
+	 * @param {object} projectBuildContext Build context for the project
+	 * @param {@ui5/fs/adapters/FileSystem} target Target adapter to write to
+	 * @param {Array<Promise>} deferredWork
+	 * @returns {Promise<void>} Promise resolving when write is complete
+	 */
+	async _writeResults(projectBuildContext, target, deferredWork) {
+		const project = projectBuildContext.getProject();
+		const taskUtil = projectBuildContext.getTaskUtil();
+		const buildConfig = this._buildContext.getBuildConfig();
+		const {createBuildManifest, outputStyle} = buildConfig;
+		// Output styles are applied only for the root project
+		const isRootProject = taskUtil.isRootProject();
+
+		let readerStyle = "dist";
+		if (createBuildManifest ||
+			(isRootProject && outputStyle === OutputStyleEnum.Namespace && project.getType() === "application")) {
+			// Ensure buildtime (=namespaced) style when writing with a build manifest or when explicitly requested
+			readerStyle = "buildtime";
+		} else if (isRootProject && outputStyle === OutputStyleEnum.Flat) {
+			readerStyle = "flat";
+		}
+
+		const reader = project.getReader({
+			style: readerStyle
+		});
+		const resources = await reader.byGlob("/**/*");
+
+		if (createBuildManifest) {
+			// Create and write a build manifest metadata file+
+			const {
+				default: createBuildManifest
+			} = await import("./helpers/createBuildManifest.js");
+			const buildManifest = await createBuildManifest(
+				project, buildConfig, this._buildContext.getTaskRepository(),
+				projectBuildContext.getBuildSignature());
+			await target.write(resourceFactory.createResource({
+				path: `/.ui5/build-manifest.json`,
+				string: JSON.stringify(buildManifest, null, "\t")
+			}));
+		}
+
+		const resourcesToWrite = resources.filter((resource) => {
+			if (taskUtil.getTag(resource, taskUtil.STANDARD_TAGS.OmitFromBuildResult)) {
+				this.#log.silly(`Skipping resource tagged as "OmitFromBuildResult": ` +
+					resource.getPath());
+				return false; // Skip this resource
+			}
+			return true;
+		});
+
+		deferredWork.push(
+			this._writeToDisk(resourcesToWrite, target, resources, project, isRootProject, outputStyle));
+	}
+
+	async _writeToDisk(resourcesToWrite, target, resources, project, isRootProject, outputStyle) {
+		await Promise.all(resourcesToWrite.map((resource) => {
+			return target.write(resource);
+		}));
+
+		if (isRootProject &&
+			outputStyle === OutputStyleEnum.Flat &&
+			/* application type is with a default flat build output structure */
+			project.getType() !== "application") {
+			const namespace = project.getNamespace();
+			const libraryResourcesPrefix = `/resources/${namespace}/`;
+			const testResourcesPrefix = "/test-resources/";
+			const namespacedRegex = new RegExp(`/(resources|test-resources)/${namespace}`);
+			const processedResourcesSet = resources.reduce(
+				(acc, resource) => acc.add(resource.getPath()), new Set());
+
+			// If outputStyle === "Flat", then the FlatReader would have filtered
+			// some resources. We now need to get all of the available resources and
+			// do an intersection with the processed/bundled ones.
+			const defaultReader = project.getReader();
+			const defaultResources = await defaultReader.byGlob("/**/*");
+			const flatDefaultResources = defaultResources.map((resource) => ({
+				flatResource: resource.getPath().replace(namespacedRegex, ""),
+				originalPath: resource.getPath(),
+			}));
+
+			const skippedResources = flatDefaultResources.filter((resource) => {
+				return processedResourcesSet.has(resource.flatResource) === false;
+			});
+
+			skippedResources.forEach((resource) => {
+				if (resource.originalPath.startsWith(testResourcesPrefix)) {
+					this.#log.verbose(
+						`Omitting ${resource.originalPath} from build result. ` +
+					`File is part of ${testResourcesPrefix}.`
+					);
+				} else if (!resource.originalPath.startsWith(libraryResourcesPrefix)) {
+					this.#log.warn(
+						`Omitting ${resource.originalPath} from build result. ` +
+							`File is not within project namespace '${namespace}'.`
+					);
+				}
+			});
+		}
+	}
+
+	/**
+	 * Execute cleanup tasks for all build contexts
+	 *
+	 * @param {boolean} [force] Whether to force cleanup execution
+	 * @returns {Promise<void>} Promise resolving when cleanup is complete
+	 */
+	async _executeCleanupTasks(force) {
+		this.#log.info("Executing cleanup tasks...");
+
+		await this._buildContext.executeCleanupTasks(force);
+	}
+
+	/**
+	 * Register signal handlers for cleanup on process termination
+	 *
+	 * @returns {object} Map of signal names to their handlers
+	 */
+	_registerCleanupSigHooks() {
+		const that = this;
+		function createListener(exitCode) {
+			return function() {
+				// Asynchronously cleanup resources, then exit
+				that._executeCleanupTasks(true).then(() => {
+					process.exit(exitCode);
+				});
+			};
+		}
+
+		const processSignals = {
+			"SIGHUP": createListener(128 + 1),
+			"SIGINT": createListener(128 + 2),
+			"SIGTERM": createListener(128 + 15),
+			"SIGBREAK": createListener(128 + 21)
+		};
+
+		for (const signal of Object.keys(processSignals)) {
+			process.on(signal, processSignals[signal]);
+		}
+
+		// TODO: Also cleanup for unhandled rejections and exceptions?
+		// Add additional events like signals since they are registered on the process
+		//	event emitter in a similar fashion
+		// processSignals["unhandledRejection"] = createListener(1);
+		// process.once("unhandledRejection", processSignals["unhandledRejection"]);
+		// processSignals["uncaughtException"] = function(err, origin) {
+		// 	const fs = require("fs");
+		// 	fs.writeSync(
+		// 		process.stderr.fd,
+		// 		`Caught exception: ${err}\n` +
+		// 		`Exception origin: ${origin}`
+		// 	);
+		// 	createListener(1)();
+		// };
+		// process.once("uncaughtException", processSignals["uncaughtException"]);
+
+		return processSignals;
+	}
+
+	/**
+	 * Remove previously registered signal handlers
+	 *
+	 * @param {object} signals Map of signal names to their handlers
+	 */
+	_deregisterCleanupSigHooks(signals) {
+		for (const signal of Object.keys(signals)) {
+			process.removeListener(signal, signals[signal]);
+		}
+	}
+
+	/**
+	 * Calculates the elapsed build time and returns a prettified output
+	 *
+	 * @param {Array} startTime Array provided by <code>process.hrtime()</code>
+	 * @returns {string} Difference between now and the provided time array as formatted string
+	 */
+	_getElapsedTime(startTime) {
+		const timeDiff = process.hrtime(startTime);
+		return prettyHrtime(timeDiff);
+	}
+}
+
+export default ProjectBuilder;

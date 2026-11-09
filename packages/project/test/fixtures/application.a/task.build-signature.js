@@ -1,0 +1,46 @@
+const Logger = require("@ui5/logger");
+const log = Logger.getLogger("builder:tasks:buildSignatureTask");
+
+const {readFile} = require("node:fs/promises");
+const {join} = require("node:path");
+
+// Reads the control file located at the project root (outside the monitored source/dependency
+// readers). Both the task body and the determineBuildSignature callback derive their value from it,
+// so a test can change the returned value / produced output independently of any source-file change.
+async function readControlValue(rootPath) {
+	const controlFilePath = join(rootPath, "buildSignatureControl.txt");
+	try {
+		const content = await readFile(controlFilePath, {encoding: "utf8"});
+		return content.trim();
+	} catch (err) {
+		// Fall back to a constant if the control file is missing
+		log.verbose(`build-signature-task: control file missing (${err.code})`);
+		return "no-control-file";
+	}
+}
+
+// Specification Version 5.0 descriptor: the task body and the determineBuildSignature callback are
+// properties of the object the default-export factory returns. Both derive their value from the control
+// file, so a test can change the returned value / produced output independently of any source change.
+module.exports = function build() {
+	return {
+		determineBuildSignature: async ({taskUtil}) => {
+			const controlValue = await readControlValue(taskUtil.getProject().getRootPath());
+			log.verbose(`build-signature-task determineBuildSignature: ${controlValue}`);
+			return controlValue;
+		},
+		// Task body: appends the current control value to the application's test.js. This makes the built
+		// output observably depend on the control file, so a served resource reflects its value.
+		task: async ({taskUtil, workspace, options: {projectNamespace}}) => {
+			log.verbose("build-signature-task executed");
+
+			const controlValue = await readControlValue(taskUtil.getProject().getRootPath());
+			const resource = await workspace.byPath(`/resources/${projectNamespace}/test.js`);
+			if (resource) {
+				const content = `${await resource.getString()}\n// build-signature-control: ${controlValue}\n`;
+				resource.setString(content);
+				await workspace.write(resource);
+			}
+		}
+	};
+};

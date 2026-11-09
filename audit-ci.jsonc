@@ -1,0 +1,55 @@
+{
+    // $schema provides code completion hints to IDEs.
+    "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+    "low": true,
+    // NOTE: Run "npm ci && npm run audit" with npm 11 or higher. Older npm versions report
+    // different vulnerability paths, so the allowlist below may not match and the audit will fail.
+    "allowlist": [
+        // GHSA-67mh-4wv8-2f99 allows malicious websites to read localhost files while dev server runs.
+        // We use VitePress for documentation build and all the information is already publicly available on GitHub Pages.
+        // Exposure during local development doesn't leak confidential information.
+        // This issue affects only the dev server. Production/CI builds are unaffected.
+        //
+        // Fix is available in VitePress 2.x with esbuild v0.25.x, but no stable release yet (only alpha).
+        "GHSA-67mh-4wv8-2f99|vitepress>vite>esbuild",
+
+        // GHSA-4w7w-66w2-5vf9 is a path traversal in Vite's dev server allowing .map file reads outside
+        // the project root when the server is network-exposed (--host).
+        // Not a risk here: the dev server is only used locally (never exposed to the network) and all
+        // documentation content is already publicly available on GitHub Pages.
+        // This issue affects only the dev server. Production/CI builds are unaffected.
+        //
+        // No fix available for Vite 5.x; patches exist only for Vite >= 6.4.2.
+        // A fix would require upgrading to VitePress 2.x (which depends on Vite 6+), but no stable release yet.
+        "GHSA-4w7w-66w2-5vf9|vitepress>vite",
+
+        // GHSA-fx2h-pf6j-xcff: vite: `server.fs.deny` bypass on Windows alternate paths
+        // Allows bypassing restrictions to read files like .env in the project. Not applicable to our case as
+        // this project does not have .env files and in general does not contain any sensitive information
+        //
+        // No fix available for Vite 5.x; patches exist only for Vite >= 6.4.3.
+        "GHSA-fx2h-pf6j-xcff|vitepress>vite",
+
+        // vitepress>vite: CVEs are dev server only; build unaffected -> not consumer facing
+        //
+        // No fix available for Vite 5.x; patches exist only for Vite >= 6.4.4 (6.4.4 / 7.3.7 / 8.1.6 / 8.2.4 / 8.3.3).
+        // Upgrading Vite is not possible because VitePress offers no newer stable release (latest is 1.6.4, which
+        // depends on vite@^5.4.14); a fix would require VitePress 2.x, available only as an alpha.
+        "GHSA-9jrq-w75r-8gcw|vitepress>vite",
+		"GHSA-rq7h-c2jc-7f22|vitepress>vite",
+
+        // Not applicable as we don't use launch-editor.
+        "GHSA-v6wh-96g9-6wx3|vitepress>vite",
+		"GHSA-587h-7wmj-h5pm|vitepress>vite",
+		"GHSA-698v-4r3x-3vcv|vitepress>vite",
+		"GHSA-r825-w8mm-5pxw|vitepress>vite",
+
+		// AI slop CVEs (not applicable) - See dependabot alert dismissals for details
+		"GHSA-hp3w-g68c-fv3c|@istanbuljs/esm-loader-hook>@istanbuljs/load-nyc-config>js-yaml>argparse>sprintf-js",
+		"GHSA-hp3w-g68c-fv3c|ava>supertap>js-yaml>argparse>sprintf-js",
+		"GHSA-hp3w-g68c-fv3c|babel-plugin-istanbul>@istanbuljs/load-nyc-config>js-yaml>argparse>sprintf-js>",
+		"GHSA-hp3w-g68c-fv3c|nyc>@istanbuljs/load-nyc-config>js-yaml>argparse>sprintf-js",
+		"GHSA-vfj7-8cjw-p6xm|ava>globby>fast-glob>micromatch>braces",
+		"GHSA-vfj7-8cjw-p6xm|micromatch>braces>"
+    ]
+}

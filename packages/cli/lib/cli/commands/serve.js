@@ -1,0 +1,306 @@
+import process from "node:process";
+import baseMiddleware from "../middlewares/base.js";
+import {applyProjectConfigOptions, applyWorkspaceOptions, applyBuildOptions, dedupeArray} from "../options.js";
+import {getUi5DataDirOrDefault, resolveServerCertificatePaths, formatPath} from "../../dataDir.js";
+import {getLogger} from "@ui5/logger";
+const log = getLogger("cli:commands:serve");
+
+// Serve
+const serve = {
+	command: "serve",
+	describe: "Start a web server for the current project",
+	middlewares: [baseMiddleware]
+};
+
+serve.builder = function(cli) {
+	applyProjectConfigOptions(cli);
+	applyWorkspaceOptions(cli);
+	applyBuildOptions(cli);
+	return cli
+		.option("port", {
+			describe: "Port to bind on (default for HTTP: 8080, HTTPS: 8443)",
+			alias: "p",
+			type: "number"
+		})
+		.option("open", {
+			describe:
+				"Open web server root directory in default browser. " +
+				"Optionally, supplied relative path will be appended to the root URL",
+			alias: "o",
+			type: "string"
+		})
+		.option("https", {
+			describe: "Enable the HTTPS protocol for the web server",
+			default: false,
+			type: "boolean"
+		})
+		.option("simple-index", {
+			describe: "Use a simplified view for the server directory listing",
+			default: false,
+			type: "boolean"
+		})
+		.option("live-reload", {
+			describe:
+				"Automatically reload the browser when project sources change. " +
+				"Overrides the 'liveReload' setting in the project's server configuration",
+			defaultDescription: "true",
+			type: "boolean"
+		})
+		.option("accept-remote-connections", {
+			describe: "Accept remote connections. By default the server only accepts connections from localhost",
+			default: false,
+			type: "boolean"
+		})
+		.option("key", {
+			describe: "Path to the private key",
+			defaultDescription: "~/.ui5/server/server.key",
+			type: "string"
+		})
+		.option("cert", {
+			describe: "Path to the certificate",
+			defaultDescription: "~/.ui5/server/server.crt",
+			type: "string"
+		})
+		.option("sap-csp-policies", {
+			describe:
+				"Always send content security policies 'sap-target-level-1' and " +
+				"'sap-target-level-3' in report-only mode",
+			default: false,
+			type: "boolean"
+		})
+		.option("serve-csp-reports", {
+			describe: "Collects and serves CSP reports upon request to '/.ui5/csp/csp-reports.json'",
+			default: false,
+			type: "boolean"
+		})
+		.option("cache", {
+			describe:
+				"Cache mode to use for building UI5 projects. " +
+				"The 'Default' behavior is to always use the build-cache if available. 'Force' uses the cache only. " +
+				"If the build-cache is unavailable or invalid, the server will fail to build the project. " +
+				"'ReadOnly' does not create or update any cache but makes use of a cache if available. " +
+				"'Off' does not use any build-cache and always triggers a rebuild of the project",
+			type: "string",
+			default: "Default",
+			choices: ["Default", "Force", "ReadOnly", "Off"],
+		})
+		.coerce("cache", (opt) => {
+			opt = dedupeArray(opt);
+			const lower = opt.toLowerCase();
+			if (lower === "readonly" || lower === "read-only") {
+				return "ReadOnly";
+			}
+			return lower.charAt(0).toUpperCase() + lower.slice(1);
+		})
+		.option("framework-version", {
+			describe: "Overrides the framework version defined by the project. " +
+				"Takes the same value as the version part of \"ui5 use\"",
+			type: "string"
+		})
+		.option("cache-mode", {
+			// Deprecated
+			hidden: true,
+			describe:
+				"As of UI5 CLI version 5, renamed to '--snapshot-cache'. " +
+				"Use '--snapshot-cache' to control this behavior.",
+			type: "string",
+			choices: ["Default", "Force", "Off"],
+		})
+		.coerce("cache-mode", (opt) => {
+			opt = dedupeArray(opt);
+			// Log a warning if this option is used
+			if (opt !== undefined) {
+				log.warn("As of UI5 CLI version 5, '--cache-mode' is renamed to '--snapshot-cache'. " +
+					"Use '--snapshot-cache' to control this behavior.");
+			}
+			return opt;
+		})
+		.option("snapshot-cache", {
+			describe:
+				"Cache mode to use when consuming SNAPSHOT versions of framework dependencies. " +
+				"The 'Default' behavior is to invalidate the cache after 9 hours. 'Force' uses the cache only and " +
+				"does not create any requests. 'Off' invalidates any existing cache and updates from the repository",
+			type: "string",
+			defaultDescription: "Default", // Use "defaultDescription" to allow undefined (needed for evaluation)
+			choices: ["Default", "Force", "Off"],
+		})
+		.coerce(["framework-version", "open", "port", "key", "cert"], dedupeArray)
+		.example("ui5 serve", "Start a web server for the current project")
+		.example("ui5 serve --https", "Enable the HTTPS protocol for the web server (requires SSL certificate)")
+		.example("ui5 serve --config /path/to/ui5.yaml", "Use the project configuration from a custom path")
+		.example("ui5 serve --dependency-definition /path/to/projectDependencies.yaml",
+			"Use a static dependency definition file")
+		.example("ui5 serve --port 1337 --open tests/QUnit.html",
+			"Listen to port 1337 and launch default browser with http://localhost:1337/test/QUnit.html");
+};
+
+serve.handler = async function(argv) {
+	// Announce the mode up front so the interactive writer can render its full
+	// frame (with placeholders for anything not resolved yet) before graph and
+	// server work begins. The server's `ui5.server-listening` event later
+	// supplies the authoritative URLs.
+	process.emit("ui5.tool-mode", {
+		mode: "serve",
+		acceptRemoteConnections: !!argv.acceptRemoteConnections,
+	});
+
+	const {graphFromStaticFile, graphFromPackageDependencies} = await import("@ui5/project/graph");
+
+	// Workspace resolution is active unless static-graph mode is used or --workspace is disabled.
+	// Single source for both the graph resolve (below) and the watcher config, so the two cannot
+	// drift on whether workspace resolution runs.
+	const workspaceActive = !argv.dependencyDefinition && argv.workspace !== false;
+
+	// One graph-construction site, reused for the initial graph and every re-init the server
+	// performs on a project-definition change. Captures argv so the server re-resolves with the
+	// same parameters.
+	const buildGraph = async () => {
+		if (argv.dependencyDefinition) {
+			return graphFromStaticFile({
+				filePath: argv.dependencyDefinition,
+				rootConfigPath: argv.config,
+				versionOverride: argv.frameworkVersion,
+				snapshotCache: argv.snapshotCache ?? argv.cacheMode ?? "Default", // Use cacheMode as fallback
+			});
+		} else {
+			return graphFromPackageDependencies({
+				rootConfigPath: argv.config,
+				versionOverride: argv.frameworkVersion,
+				snapshotCache: argv.snapshotCache ?? argv.cacheMode ?? "Default", // Use cacheMode as fallback
+				workspaceConfigPath: argv.workspaceConfig,
+				workspaceName: workspaceActive ? argv.workspace : null,
+			});
+		}
+	};
+
+	// Build the initial graph up front: its root server settings resolve the port and live-reload
+	// defaults below, before the server binds.
+	const graph = await buildGraph();
+
+	let port = argv.port;
+	let changePortIfInUse = false;
+
+	if (!port && graph.getRoot().getServerSettings()) {
+		const serverSettings = graph.getRoot().getServerSettings();
+		if (argv.https) {
+			port = serverSettings.httpsPort;
+		} else {
+			port = serverSettings.httpPort;
+		}
+	}
+
+	if (!port) {
+		changePortIfInUse = true; // only change if port isn't explicitly set
+		if (argv.https) {
+			port = 8443;
+		} else {
+			port = 8080;
+		}
+	}
+
+	let liveReload = argv.liveReload;
+	if (liveReload === undefined) {
+		const serverSettings = graph.getRoot().getServerSettings();
+		if (serverSettings && serverSettings.liveReload !== undefined) {
+			liveReload = serverSettings.liveReload;
+		} else {
+			liveReload = true;
+		}
+	}
+
+	const {isWatchingDisabled} = await import("@ui5/project/internal/build/helpers/fileWatcher");
+	if (isWatchingDisabled()) {
+		// Watchers are disabled. The server builds resources on demand but does not
+		// rebuild them on change. An edit to sources or configuration while it runs is not picked up
+		// and can produce an inconsistent result until the server is restarted.
+		log.info(
+			`File watching is disabled through environment configuration. ` +
+			`Changes to sources or project configuration will require a server restart.`);
+		if (liveReload) {
+			// Live reload needs a watcher to learn when to push.
+			log.info(`Live reload has been disabled because it requires file watching.`);
+			liveReload = false;
+		}
+	}
+
+	const serverConfig = {
+		port,
+		changePortIfInUse,
+		https: argv.https,
+		simpleIndex: !!argv.simpleIndex,
+		liveReload: !!liveReload,
+		acceptRemoteConnections: !!argv.acceptRemoteConnections,
+		cert: argv.https ? argv.cert : undefined,
+		key: argv.https ? argv.key : undefined,
+		sendSAPTargetCSP: !!argv.sapCspPolicies,
+		serveCSPReports: !!argv.serveCspReports,
+		cache: argv.cache,
+		includedTasks: argv["include-task"],
+		excludedTasks: argv["exclude-task"],
+		// Threaded to the definition watcher so it watches the same files buildGraph resolves from.
+		// null selects the watcher's default ui5-workspace.yaml, undefined disables workspace watching.
+		rootConfigPath: argv.config,
+		workspaceConfigPath: workspaceActive ? (argv.workspaceConfig ?? null) : undefined,
+		dependencyDefinitionPath: argv.dependencyDefinition,
+	};
+
+	if (serverConfig.https) {
+		// A default certificate path is only needed for HTTPS, so the UI5 data directory is
+		// resolved once here rather than for every serve invocation.
+		const ui5DataDir = await getUi5DataDirOrDefault({cwd: process.cwd()});
+		const {keyPath, certPath} = resolveServerCertificatePaths(ui5DataDir, {
+			keyPath: serverConfig.key,
+			certPath: serverConfig.cert,
+		});
+
+		const {getSslCertificate, SslCertificateNotFoundError} = await import("@ui5/server/internal/sslUtil");
+		try {
+			const {key, cert} = await getSslCertificate(keyPath, certPath);
+			serverConfig.key = key;
+			serverConfig.cert = cert;
+		} catch (err) {
+			if (err instanceof SslCertificateNotFoundError) {
+				const keyOrigin = serverConfig.key ? "--key" : "default location";
+				const certOrigin = serverConfig.cert ? "--cert" : "default location";
+				throw new Error(
+					`Failed to find required SSL certificate for launching the HTTPS server.\n` +
+					`Looked for:\n` +
+					`  Private key: ${formatPath(keyPath)} (${keyOrigin})\n` +
+					`  Certificate: ${formatPath(certPath)} (${certOrigin})\n` +
+					`To fix this, either:\n` +
+					`  • Run "ui5 certificate generate" to create and install one (recommended), or\n` +
+					`  • Pass existing files with --key and --cert`
+				);
+			}
+			throw err;
+		}
+	}
+
+	const {promise: pOnError, reject} = Promise.withResolvers();
+	const {serve: serverServe} = await import("@ui5/server");
+	// The server does not depend on @ui5/project; inject the definition-watcher namespace it needs for
+	// re-resolution. The CLI owns @ui5/project.
+	const projectWatcher = await import("@ui5/project/internal/graph/ProjectDefinitionWatcher");
+	// Pass buildGraph as the graphFactory so the server can re-resolve the graph and re-create
+	// the serving stack when its definition watcher observes a project-definition change.
+	const {https, port: actualPort} = await serverServe(graph, serverConfig, function(err) {
+		reject(err);
+	}, buildGraph, projectWatcher);
+
+	if (argv.open !== undefined) {
+		const protocol = https ? "https" : "http";
+		let browserUrl = protocol + "://localhost:" + actualPort;
+		if (typeof argv.open === "string") {
+			let relPath = argv.open || "/";
+			if (!relPath.startsWith("/")) {
+				relPath = "/" + relPath;
+			}
+			browserUrl += relPath;
+		}
+		const {default: open} = await import("open");
+		open(browserUrl);
+	}
+	await pOnError; // Await errors that should bubble into the yargs handler
+};
+
+export default serve;

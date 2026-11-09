@@ -1,0 +1,178 @@
+import {existsSync, readFileSync} from "node:fs";
+import {getLogger} from "@ui5/logger";
+
+const log = getLogger("build:helpers:fileWatcher");
+
+/**
+ * Entry point every watcher consumer calls instead of <code>@parcel/watcher</code> directly. It
+ * selects a watcher backend once per process and exposes a <code>subscribe</code> matching
+ * <code>@parcel/watcher</code>'s exact signature and return contract, so a caller cannot tell which
+ * backend is active.
+ *
+ * The native backend is <code>@parcel/watcher</code>. It is the default and covers the common case.
+ * Inside a container, Linux inotify often reports the container's own writes but not writes made to a
+ * mounted volume from outside the container (the common case in Podman). The incremental build
+ * derives "what changed" solely from watcher events, so those missed events break rebuilds and live
+ * reload. The polling backend in <code>pollingWatcher.js</code> reads the tree directly, so it sees
+ * every change regardless of where it originated.
+ *
+ * Both backends are imported lazily, only when selected, so neither module enters the import tree on
+ * the path that does not use it. <code>@parcel/watcher</code> resolves a native binding at load time
+ * and throws when the platform's prebuilt binary is not installed, so a static import here would
+ * break every consumer before the polling fallback could run. Loading it on demand keeps that failure
+ * contained: when the native backend is selected but cannot load, subscribe() falls back to polling,
+ * which needs no native code.
+ *
+ * <code>UI5_WATCH_MODE=off</code> disables watching entirely: subscribe() returns an inert
+ * subscription that never invokes its callback, so no backend is loaded and no filesystem is polled.
+ * This is meant for CI and other environments where sources do not change while the server runs, so
+ * the watching overhead (especially the polling backend's tree walk on container volumes) adds cost
+ * without benefit.
+ *
+ * @private
+ * @module @ui5/project/build/helpers/fileWatcher
+ */
+
+// Marker files the container runtimes drop into the root filesystem: /.dockerenv by Docker,
+// /run/.containerenv by Podman.
+const CONTAINER_MARKER_FILES = ["/.dockerenv", "/run/.containerenv"];
+
+// cgroup path fragments that appear only when PID 1 runs under a container runtime.
+const rContainerCgroup = /\b(?:docker|libpod|containerd|kubepods)\b/;
+
+// Memoized backend decision, one of "native" | "polling" | "off". Computed once per process and
+// shared by every subscribe() call.
+let watchBackend = null;
+
+// Memoized load of the native backend. nativeBackendPromise holds the single in-flight (or
+// settled) load so concurrent subscribe() calls await the same import instead of each reading
+// nativeBackend before it resolves. It resolves to the @parcel/watcher module, or null when it
+// could not load (e.g. no prebuilt binary for this platform); a null result is not retried.
+let nativeBackendPromise = null;
+
+/**
+ * Decides the watcher backend, once per process. <code>UI5_WATCH_MODE=off|polling|native</code>
+ * forces the choice; otherwise polling is the default inside a container and the native backend is
+ * the default elsewhere.
+ *
+ * @returns {"native"|"polling"|"off"} The selected backend
+ */
+function getWatchBackend() {
+	return (watchBackend ??= decideBackend());
+}
+
+/**
+ * @returns {boolean} True when the polling backend should be used
+ */
+export function shouldUsePolling() {
+	return getWatchBackend() === "polling";
+}
+
+/**
+ * @returns {boolean} True when file watching is disabled (<code>UI5_WATCH_MODE=off</code>)
+ */
+export function isWatchingDisabled() {
+	return getWatchBackend() === "off";
+}
+
+function decideBackend() {
+	const mode = process.env.UI5_WATCH_MODE;
+	if (mode === "off") {
+		log.verbose(`UI5_WATCH_MODE=off: file watching is disabled`);
+		return "off";
+	}
+	if (mode === "polling") {
+		log.verbose(`UI5_WATCH_MODE=polling: using polling file watcher`);
+		return "polling";
+	}
+	if (mode === "native") {
+		log.verbose(`UI5_WATCH_MODE=native: using native file watcher`);
+		return "native";
+	}
+	if (mode) {
+		log.warn(`Ignoring invalid UI5_WATCH_MODE '${mode}', detecting file watcher backend`);
+	}
+
+	if (isRunningInContainer()) {
+		log.info(`Detected a container environment: using the polling file watcher. Inside a ` +
+			`container, inotify often does not report changes made to a mounted volume from outside ` +
+			`the container. Set UI5_WATCH_MODE=native to force the native watcher.`);
+		return "polling";
+	}
+	log.verbose(`No container environment detected, using the native file watcher`);
+	return "native";
+}
+
+// Reports whether the process runs inside a container. Checks the marker files the runtimes drop
+// into the root filesystem, then PID 1's cgroup membership. A container is a heuristic, not a
+// guarantee: UI5_WATCH_MODE overrides it either way. Any filesystem error means the check could not
+// prove a container, so it reports false (the native backend), which also covers non-Linux hosts
+// where /proc/1/cgroup does not exist.
+function isRunningInContainer() {
+	for (const marker of CONTAINER_MARKER_FILES) {
+		if (existsSync(marker)) {
+			return true;
+		}
+	}
+	try {
+		return rContainerCgroup.test(readFileSync("/proc/1/cgroup", "utf8"));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Subscribes to filesystem changes below <code>dir</code>, matching
+ * <code>@parcel/watcher</code>'s <code>subscribe</code> signature and return contract. When watching
+ * is disabled (<code>UI5_WATCH_MODE=off</code>), the returned subscription is inert: its callback is
+ * never invoked and <code>unsubscribe</code> is a no-op.
+ *
+ * @param {string} dir Directory to watch
+ * @param {Function} callback Invoked as <code>(err, events)</code>, events being
+ *   <code>{type: "create"|"update"|"delete", path: string}</code>
+ * @param {object} [opts]
+ * @param {string[]} [opts.ignore] Path/glob patterns to ignore, matched relative to <code>dir</code>
+ *   (same semantics as the native backend)
+ * @param {number} [opts.pollInterval] Poll interval in ms for the polling backend. Internal option.
+ *   The native backend ignores it. Defaults to 250 ms.
+ * @returns {Promise<{unsubscribe: Function}>} Resolves once the watcher is ready
+ */
+export async function subscribe(dir, callback, opts = {}) {
+	if (isWatchingDisabled()) {
+		// Watching is off (UI5_WATCH_MODE=off). Return an inert subscription the caller tracks and
+		// unsubscribes exactly as a real one, but the callback is never invoked, so no backend loads
+		// and no rebuild or live reload is ever triggered.
+		return {unsubscribe: async () => {}};
+	}
+	if (!shouldUsePolling()) {
+		const native = await loadNativeBackend();
+		if (native) {
+			return native.subscribe(dir, callback, opts);
+		}
+		// The native binding could not load (see loadNativeBackend). Polling needs no native code, so
+		// fall through to it rather than failing the watch.
+	}
+	// Loaded on demand: polling is the exception, so its module never enters the import tree when the
+	// native backend is used.
+	const {subscribe: subscribePolling} = await import("./pollingWatcher.js");
+	return subscribePolling(dir, callback, opts);
+}
+
+// Loads @parcel/watcher on demand and memoizes the in-flight load. Imported here rather than at
+// module top because it resolves a native binding at load time and throws when the platform's
+// prebuilt binary is not installed. A failure resolves to null (logged once) so subscribe() can
+// fall back to polling instead of taking down every consumer. The promise is memoized (not a
+// pre-await flag) so concurrent callers cannot observe a half-initialized backend and wrongly
+// fall back to polling.
+function loadNativeBackend() {
+	return (nativeBackendPromise ??= (async () => {
+		try {
+			return (await import("@parcel/watcher")).default;
+		} catch (err) {
+			log.warn(`Could not load the native file watcher (@parcel/watcher), falling back to ` +
+				`polling. This usually means the prebuilt binary for this platform was not installed. ` +
+				`Original error: ${err.message}`);
+			return null;
+		}
+	})());
+}
