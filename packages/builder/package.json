@@ -93,7 +93,7 @@
 		"@jridgewell/sourcemap-codec": "^1.6.0",
 		"@ui5/fs": "^5.0.0-alpha.15",
 		"@ui5/logger": "^5.0.0-alpha.15",
-		"cheerio": "1.0.0",
+		"cheerio": "1.2.0",
 		"escape-unicode": "^0.3.0",
 		"escope": "^4.0.0",
 		"espree": "^11.2.0",
